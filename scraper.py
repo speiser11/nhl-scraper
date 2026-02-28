@@ -349,8 +349,32 @@ def run():
 
     (DATA_DIR / "today.json").write_text(json.dumps(output, indent=2))
     print(f"\n✓ Done — {len(players)} players, {len(app_games)} games")
+    push_to_gist(output)
     return output
 
 
 if __name__ == "__main__":
     run()
+
+
+def push_to_gist(data):
+    """Update the GitHub Gist with today's scraped data."""
+    import os
+    token = os.environ.get("GITHUB_TOKEN")
+    gist_id = os.environ.get("GIST_ID")
+    if not token or not gist_id:
+        print("  Skipping Gist push — GITHUB_TOKEN or GIST_ID not set")
+        return
+    try:
+        url = f"https://api.github.com/gists/{gist_id}"
+        payload = {"files": {"nhl-today.json": {"content": json.dumps(data, indent=2)}}}
+        r = requests.patch(url, json=payload, headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }, timeout=15)
+        if r.ok:
+            print(f"  ✓ Gist updated successfully")
+        else:
+            print(f"  ✗ Gist update failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"  ✗ Gist push error: {e}")
