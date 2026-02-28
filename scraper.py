@@ -13,7 +13,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 
-from scraper import run as run_scraper
+
 
 app = Flask(__name__)
 CORS(app)
