@@ -66,7 +66,8 @@ def get_tonight_games():
                         games.append({"away": away, "home": home, "time": g.get("startTimeUTC", ""), "id": g.get("id", "")})
                 except Exception as e:
                     print(f"  Game parse error: {e}")
-    print(f"Games tonight: {[f'{g[\"away\"]}@{g[\"home\"]}' for g in games]}")
+    game_list = [g["away"] + "@" + g["home"] for g in games]
+    print(f"Games tonight: {game_list}")
     return games
 
 
