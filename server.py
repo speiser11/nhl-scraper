@@ -10,17 +10,20 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from pathlib import Path
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 
 from scraper import run as run_scraper
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from Claude artifact (any origin)
+CORS(app)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATA_FILE = Path("data/today.json")
+scraper_running = False
+scraper_status = "idle"
 
 
 def load_today():
@@ -29,9 +32,28 @@ def load_today():
     return None
 
 
+def run_scraper_background():
+    global scraper_running, scraper_status
+    if scraper_running:
+        logger.info("Scraper already running, skipping")
+        return
+    scraper_running = True
+    scraper_status = "running"
+    try:
+        logger.info("Scraper starting...")
+        run_scraper()
+        scraper_status = "done"
+        logger.info("Scraper complete")
+    except Exception as e:
+        scraper_status = f"error: {e}"
+        logger.error(f"Scraper failed: {e}")
+    finally:
+        scraper_running = False
+
+
 @app.route("/")
 def index():
-    return jsonify({"status": "NHL Scraper API running", "endpoints": ["/today", "/health", "/refresh"]})
+    return jsonify({"status": "NHL Scraper API", "endpoints": ["/today", "/health", "/refresh"]})
 
 
 @app.route("/health")
@@ -39,66 +61,52 @@ def health():
     data = load_today()
     return jsonify({
         "status": "ok",
+        "scraper_status": scraper_status,
         "data_available": data is not None,
         "data_date": data.get("date") if data else None,
         "scraped_at": data.get("scraped_at") if data else None,
+        "player_count": len(data.get("players", {})) if data else 0,
     })
 
 
 @app.route("/today")
 def today():
-    """Main endpoint — returns today's full scraped data for the app."""
     data = load_today()
     if not data:
-        return jsonify({"error": "No data available yet. Scraper may not have run today."}), 404
-
+        return jsonify({"error": "No data yet — hit /refresh to run the scraper"}), 404
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if data.get("date") != today_str:
-        return jsonify({
-            "warning": f"Data is from {data.get('date')}, not today ({today_str}). Scraper may not have run yet.",
-            **data
-        })
-
+        return jsonify({"warning": f"Data is from {data.get('date')}, not today. Hit /refresh.", **data})
     return jsonify(data)
 
 
 @app.route("/refresh")
 def refresh():
-    """Manually trigger a scraper run. Useful if you need to re-pull mid-day."""
-    logger.info("Manual refresh triggered")
-    try:
-        run_scraper()
-        data = load_today()
-        return jsonify({"status": "ok", "message": "Scraper ran successfully", "players": len(data.get("players", {}))})
-    except Exception as e:
-        logger.error(f"Scraper error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    """Trigger scraper in background — returns immediately."""
+    if scraper_running:
+        return jsonify({"status": "already_running", "message": "Scraper is already running, check /health for progress"})
+    thread = threading.Thread(target=run_scraper_background, daemon=True)
+    thread.start()
+    return jsonify({"status": "started", "message": "Scraper started in background. Check /health in 2-3 minutes for results."})
 
 
 def scheduled_scrape():
     logger.info("Scheduled scrape starting...")
-    try:
-        run_scraper()
-        logger.info("Scheduled scrape complete")
-    except Exception as e:
-        logger.error(f"Scheduled scrape failed: {e}")
+    run_scraper_background()
 
 
 if __name__ == "__main__":
-    # Run scraper once on startup if no data for today
+    # Run scraper on startup if no data for today
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     existing = load_today()
     if not existing or existing.get("date") != today_str:
         logger.info("No data for today — running scraper on startup...")
-        try:
-            run_scraper()
-        except Exception as e:
-            logger.error(f"Startup scrape failed: {e}")
+        thread = threading.Thread(target=run_scraper_background, daemon=True)
+        thread.start()
 
-    # Schedule daily scrape at 10am ET (15:00 UTC)
     scheduler = BackgroundScheduler()
     scheduler.add_job(scheduled_scrape, "cron", hour=15, minute=0)
     scheduler.start()
-    logger.info("Scheduler started — scraper will run daily at 10am ET")
+    logger.info("Scheduler started — scraper runs daily at 10am ET")
 
     app.run(host="0.0.0.0", port=8080)
