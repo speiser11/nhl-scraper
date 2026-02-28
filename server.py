@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from scraper import run as run_scraper
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins="*", allow_headers=["Content-Type"], methods=["GET", "OPTIONS"])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
