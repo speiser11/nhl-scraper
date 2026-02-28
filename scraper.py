@@ -22,152 +22,171 @@ NHL_API = "https://api-web.nhle.com/v1"
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Map DailyFaceoff team names to NHL API abbreviations
-TEAM_MAP = {
-    "Anaheim Ducks": "ANA", "Boston Bruins": "BOS", "Buffalo Sabres": "BUF",
-    "Calgary Flames": "CGY", "Carolina Hurricanes": "CAR", "Chicago Blackhawks": "CHI",
-    "Colorado Avalanche": "COL", "Columbus Blue Jackets": "CBJ", "Dallas Stars": "DAL",
-    "Detroit Red Wings": "DET", "Edmonton Oilers": "EDM", "Florida Panthers": "FLA",
-    "Minnesota Wild": "MIN", "Montreal Canadiens": "MTL", "Nashville Predators": "NSH",
-    "New Jersey Devils": "NJD", "New York Islanders": "NYI", "New York Rangers": "NYR",
-    "Ottawa Senators": "OTT", "Philadelphia Flyers": "PHI", "Pittsburgh Penguins": "PIT",
-    "San Jose Sharks": "SJS", "Seattle Kraken": "SEA", "St. Louis Blues": "STL",
-    "Tampa Bay Lightning": "TBL", "Toronto Maple Leafs": "TOR", "Utah Mammoth": "UTA",
-    "Vancouver Canucks": "VAN", "Vegas Golden Knights": "VGK", "Washington Capitals": "WSH",
-    "Winnipeg Jets": "WPG",
-}
+DEFAULT_SHOTS_AGAINST = 29.0
+DEFAULT_SAVE_PCT = 0.910
 
 
-# ── NHL API helpers ────────────────────────────────────────────────────────────
-def get_tonight_games():
-    """Fetch tonight's NHL schedule from the official API."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    url = f"{NHL_API}/schedule/{today}"
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def safe_get(d, *keys, default=None):
+    """Safely traverse nested dicts."""
+    for key in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(key)
+        if d is None:
+            return default
+    return d
+
+
+def api_get(url, label=""):
+    """GET with error handling — returns parsed JSON or None."""
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        games = []
-        for game_week in data.get("gameWeek", []):
-            if game_week.get("date") == today:
-                for g in game_week.get("games", []):
-                    away = g["awayTeam"]["abbrev"]
-                    home = g["homeTeam"]["abbrev"]
-                    game_time = g.get("startTimeUTC", "")
-                    games.append({"away": away, "home": home, "time": game_time, "id": g["id"]})
-        print(f"Found {len(games)} games tonight: {[f'{g['away']}@{g['home']}' for g in games]}")
-        return games
+        return r.json()
     except Exception as e:
-        print(f"Error fetching schedule: {e}")
+        print(f"  API error [{label}]: {e}")
+        return None
+
+
+# ── NHL API ────────────────────────────────────────────────────────────────────
+def get_tonight_games():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    data = api_get(f"{NHL_API}/schedule/{today}", "schedule")
+    if not data:
         return []
+    games = []
+    for gw in data.get("gameWeek", []):
+        if gw.get("date") == today:
+            for g in gw.get("games", []):
+                try:
+                    away = safe_get(g, "awayTeam", "abbrev", default="")
+                    home = safe_get(g, "homeTeam", "abbrev", default="")
+                    if away and home:
+                        games.append({"away": away, "home": home, "time": g.get("startTimeUTC", ""), "id": g.get("id", "")})
+                except Exception as e:
+                    print(f"  Game parse error: {e}")
+    print(f"Games tonight: {[f'{g[\"away\"]}@{g[\"home\"]}' for g in games]}")
+    return games
 
 
 def get_team_stats(team_abbr):
-    """Get team shots-against per game from NHL API."""
-    try:
-        url = f"{NHL_API}/club-stats/{team_abbr}/now"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        # shots against per game
-        sa_pg = data.get("teamStats", {}).get("shotsAgainstPerGame", None)
-        return round(float(sa_pg), 1) if sa_pg else 29.0
-    except Exception as e:
-        print(f"  Warning: Could not get team stats for {team_abbr}: {e}")
-        return 29.0
+    """Shots-against per game from standings."""
+    data = api_get(f"{NHL_API}/standings/now", "standings")
+    if data:
+        for team in data.get("standings", []):
+            abbrev = safe_get(team, "teamAbbrev", "default") or team.get("teamAbbrev", "")
+            if abbrev == team_abbr:
+                gp = team.get("gamesPlayed", 1) or 1
+                sa = team.get("shotsAgainst", None)
+                if sa:
+                    result = round(sa / gp, 1)
+                    print(f"  {team_abbr} SA/g: {result}")
+                    return result
+    print(f"  {team_abbr} SA/g: default {DEFAULT_SHOTS_AGAINST}")
+    return DEFAULT_SHOTS_AGAINST
 
 
 def get_goalie_stats(team_abbr):
-    """Get starting goalie and their SV% from NHL API roster + stats."""
-    try:
-        # Get roster
-        url = f"{NHL_API}/roster/{team_abbr}/current"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        roster = r.json()
+    """Best goalie SV% from roster + player landing pages."""
+    data = api_get(f"{NHL_API}/roster/{team_abbr}/current", f"roster/{team_abbr}")
+    if not data:
+        return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0}
 
-        goalies = roster.get("goalies", [])
-        best_goalie = None
-        best_gp = 0
+    best = None
+    best_gp = 0
 
-        for g in goalies:
-            pid = g["id"]
-            # Get player stats
-            stats_url = f"{NHL_API}/player/{pid}/landing"
-            sr = requests.get(stats_url, timeout=10)
-            if not sr.ok:
-                continue
-            sdata = sr.json()
-            season_stats = sdata.get("featuredStats", {}).get("regularSeason", {}).get("subSeason", {})
-            gp = season_stats.get("gamesPlayed", 0)
-            svp = season_stats.get("savePctg", None)
-            name = f"{g.get('firstName', {}).get('default', '')} {g.get('lastName', {}).get('default', '')}"
-            if gp > best_gp and svp is not None:
-                best_gp = gp
-                best_goalie = {"name": name, "save_pct": round(float(svp), 3), "gp": gp}
+    for g in data.get("goalies", []):
+        pid = g.get("id")
+        if not pid:
+            continue
+        sdata = api_get(f"{NHL_API}/player/{pid}/landing", f"goalie/{pid}")
+        if not sdata:
+            continue
 
-        if best_goalie:
-            print(f"  Goalie {team_abbr}: {best_goalie['name']} {best_goalie['save_pct']}")
-            return best_goalie
-        return {"name": "Unknown", "save_pct": 0.910, "gp": 0}
+        # Try multiple key paths for season stats
+        sub = (
+            safe_get(sdata, "featuredStats", "regularSeason", "subSeason") or
+            safe_get(sdata, "last5Games", 0) or
+            {}
+        )
+        # Also check seasonTotals array
+        if not sub:
+            totals = sdata.get("seasonTotals", [])
+            for t in totals:
+                if t.get("season") and t.get("gamesPlayed"):
+                    sub = t
+                    break
 
-    except Exception as e:
-        print(f"  Warning: Could not get goalie for {team_abbr}: {e}")
-        return {"name": "Unknown", "save_pct": 0.910, "gp": 0}
+        gp = sub.get("gamesPlayed", 0) or sub.get("gp", 0) or 0
+        svp = sub.get("savePctg") or sub.get("savePct") or sub.get("svPct") or sub.get("savePercentage")
+
+        fname = safe_get(g, "firstName", "default") or str(g.get("firstName", ""))
+        lname = safe_get(g, "lastName", "default") or str(g.get("lastName", ""))
+        name = f"{fname} {lname}".strip()
+
+        print(f"  {team_abbr} goalie candidate: {name} GP={gp} SV%={svp}")
+
+        if gp > best_gp and svp is not None:
+            best_gp = gp
+            best = {"name": name, "save_pct": round(float(svp), 3), "gp": gp}
+
+    if best:
+        print(f"  {team_abbr} goalie selected: {best['name']} {best['save_pct']}")
+        return best
+
+    print(f"  {team_abbr} goalie: default")
+    return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0}
 
 
 def get_player_season_stats(player_name, team_abbr):
-    """Search for a player and return their season SOG stats."""
-    try:
-        # Search by name
-        search_url = f"{NHL_API}/player/{player_name.lower().replace(' ', '-')}/landing"
-        # Try roster approach instead - find player on team roster
-        roster_url = f"{NHL_API}/roster/{team_abbr}/current"
-        r = requests.get(roster_url, timeout=10)
-        if not r.ok:
-            return None
-        roster = r.json()
+    """Season SOG/g and TOI for a player."""
+    data = api_get(f"{NHL_API}/roster/{team_abbr}/current", f"roster/{team_abbr}")
+    if not data:
+        return None
 
-        all_players = roster.get("forwards", []) + roster.get("defensemen", [])
-        target = player_name.lower().strip()
+    all_players = data.get("forwards", []) + data.get("defensemen", [])
+    target_last = player_name.lower().split()[-1]
+    target_full = player_name.lower().strip()
 
-        for p in all_players:
-            fname = p.get("firstName", {}).get("default", "")
-            lname = p.get("lastName", {}).get("default", "")
-            full = f"{fname} {lname}".lower()
-            if full == target or lname.lower() == target.split()[-1].lower():
-                pid = p["id"]
-                stats_url = f"{NHL_API}/player/{pid}/landing"
-                sr = requests.get(stats_url, timeout=10)
-                if not sr.ok:
-                    continue
-                sdata = sr.json()
-                sub = sdata.get("featuredStats", {}).get("regularSeason", {}).get("subSeason", {})
-                gp = sub.get("gamesPlayed", 1)
-                shots = sub.get("shots", 0)
-                toi_str = sub.get("avgToi", "0:00")
-                # Parse TOI mm:ss -> decimal
-                parts = toi_str.split(":")
-                toi_dec = int(parts[0]) + int(parts[1]) / 60 if len(parts) == 2 else 0
-                sog_pg = round(shots / max(gp, 1), 1)
-                return {
-                    "season_sog": sog_pg,
-                    "toi": round(toi_dec, 1),
-                    "gp": gp,
-                    "id": pid,
-                }
-    except Exception as e:
-        print(f"  Warning: Could not get stats for {player_name}: {e}")
+    for p in all_players:
+        fname = safe_get(p, "firstName", "default") or str(p.get("firstName", ""))
+        lname = safe_get(p, "lastName", "default") or str(p.get("lastName", ""))
+        full = f"{fname} {lname}".lower().strip()
+
+        if full == target_full or lname.lower() == target_last:
+            pid = p.get("id")
+            if not pid:
+                continue
+            sdata = api_get(f"{NHL_API}/player/{pid}/landing", f"player/{pid}")
+            if not sdata:
+                continue
+
+            sub = safe_get(sdata, "featuredStats", "regularSeason", "subSeason") or {}
+            if not sub:
+                totals = sdata.get("seasonTotals", [])
+                for t in totals:
+                    if t.get("gamesPlayed", 0) > 0:
+                        sub = t
+                        break
+
+            gp = max(sub.get("gamesPlayed", 1) or sub.get("gp", 1) or 1, 1)
+            shots = sub.get("shots", 0) or sub.get("sog", 0) or 0
+            toi_str = sub.get("avgToi", "17:00") or "17:00"
+
+            try:
+                parts = str(toi_str).split(":")
+                toi_dec = int(parts[0]) + int(parts[1]) / 60 if len(parts) == 2 else 17.0
+            except:
+                toi_dec = 17.0
+
+            return {"season_sog": round(shots / gp, 1), "toi": round(toi_dec, 1), "gp": gp}
+
     return None
 
 
 # ── DailyFaceoff scraper ───────────────────────────────────────────────────────
 def scrape_dailyfaceoff_lines(team_abbr):
-    """
-    Scrape line combinations and PP units for a team from DailyFaceoff.
-    Returns dict with lines and pp_units.
-    """
-    # DailyFaceoff uses full team names in URLs
     abbr_to_slug = {
         "ANA": "anaheim-ducks", "BOS": "boston-bruins", "BUF": "buffalo-sabres",
         "CGY": "calgary-flames", "CAR": "carolina-hurricanes", "CHI": "chicago-blackhawks",
@@ -184,111 +203,88 @@ def scrape_dailyfaceoff_lines(team_abbr):
 
     slug = abbr_to_slug.get(team_abbr, "")
     if not slug:
-        return None
+        return {"lines": [], "pp_units": [], "raw_html_ok": False}
 
     url = f"https://www.dailyfaceoff.com/teams/{slug}/line-combinations/"
-    print(f"  Scraping {url}")
+    print(f"  Scraping: {url}")
 
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+        result = {"lines": [], "pp_units": [], "raw_html_ok": True}
 
-        result = {
-            "lines": [],      # [{"line": 1, "lw": "Name", "c": "Name", "rw": "Name"}]
-            "pp_units": [],   # [{"unit": 1, "players": ["Name", ...]}]
-            "raw_html_ok": True,
-        }
+        # Grab all player links — DailyFaceoff player links contain /players/
+        player_links = soup.find_all("a", href=re.compile(r"/players/"))
+        seen = []
+        for a in player_links:
+            name = a.get_text(strip=True)
+            if name and len(name) > 3 and name not in seen:
+                seen.append(name)
 
-        # ── Parse even-strength lines ──
-        # DailyFaceoff line tables have class patterns like "line-combos"
-        line_tables = soup.find_all("table", class_=re.compile(r"line", re.I))
-        if not line_tables:
-            # Try finding by section headers
-            line_tables = soup.find_all("div", class_=re.compile(r"line-combo", re.I))
+        # First 12 = 4 forward lines of 3
+        for i in range(0, min(len(seen), 12), 3):
+            chunk = seen[i:i+3]
+            if len(chunk) == 3:
+                result["lines"].append({
+                    "line": len(result["lines"]) + 1,
+                    "lw": chunk[0], "c": chunk[1], "rw": chunk[2],
+                })
 
-        for table in line_tables[:4]:  # lines 1-4
-            rows = table.find_all("tr")
-            for row in rows:
-                cells = row.find_all("td")
-                if len(cells) >= 3:
-                    players = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
-                    if len(players) >= 3:
-                        result["lines"].append({
-                            "line": len(result["lines"]) + 1,
-                            "lw": players[0],
-                            "c": players[1],
-                            "rw": players[2],
-                        })
+        # PP units — look for section headings
+        pp_texts = soup.find_all(string=re.compile(r"Power Play|PP1|PP2", re.I))
+        pp_players_seen = []
+        for pt in pp_texts[:2]:
+            parent = pt.find_parent()
+            if not parent:
+                continue
+            unit_num = 1 if not pp_players_seen else 2
+            pp_links = parent.find_all_next("a", href=re.compile(r"/players/"), limit=5)
+            names = [a.get_text(strip=True) for a in pp_links if a.get_text(strip=True) not in pp_players_seen]
+            if names:
+                result["pp_units"].append({"unit": unit_num, "players": names[:5]})
+                pp_players_seen.extend(names[:5])
 
-        # ── Parse PP units ──
-        pp_sections = soup.find_all(string=re.compile(r"Power Play", re.I))
-        for pp_text in pp_sections:
-            parent = pp_text.parent
-            # Look for player names near this section
-            unit_num = 1 if "1" in str(pp_text) else 2
-            nearby = parent.find_next("table") or parent.find_next("ul")
-            if nearby:
-                names = [el.get_text(strip=True) for el in nearby.find_all(["td", "li", "span"])
-                         if el.get_text(strip=True) and len(el.get_text(strip=True)) > 3]
-                if names:
-                    result["pp_units"].append({"unit": unit_num, "players": names[:5]})
-
-        print(f"  {team_abbr}: {len(result['lines'])} lines, {len(result['pp_units'])} PP units found")
+        print(f"  {team_abbr}: {len(result['lines'])} lines, {len(result['pp_units'])} PP units")
         return result
 
-    except requests.RequestException as e:
+    except Exception as e:
         print(f"  Error scraping {team_abbr}: {e}")
         return {"lines": [], "pp_units": [], "raw_html_ok": False, "error": str(e)}
 
 
-# ── Build player objects ───────────────────────────────────────────────────────
-def build_player_data(games, lines_data, goalie_data, team_stats_data):
-    """
-    Combine line data with NHL API stats to build PLAYER_DATA object
-    matching the format expected by the app.
-    """
+# ── Build player data ──────────────────────────────────────────────────────────
+def build_player_data(games, lines_data, goalie_data):
     players = {}
-
-    # Determine which teams are home vs away
     home_teams = {g["home"] for g in games}
-    away_teams = {g["away"] for g in games}
 
     for team_abbr, team_lines in lines_data.items():
+        if not team_lines:
+            continue
         is_home = team_abbr in home_teams
 
-        # Determine PP unit per player
         pp_assignment = {}
         for pp in team_lines.get("pp_units", []):
             for name in pp.get("players", []):
-                pp_assignment[name.lower()] = pp["unit"]
+                if name and name.strip():
+                    pp_assignment[name.strip().lower()] = pp["unit"]
 
-        # Process each line
         for line in team_lines.get("lines", []):
             for pos, name in [("LW", line.get("lw")), ("C", line.get("c")), ("RW", line.get("rw"))]:
                 if not name or name in players:
                     continue
-
-                # Get stats from NHL API
                 api_stats = get_player_season_stats(name, team_abbr)
                 season_sog = api_stats["season_sog"] if api_stats else 2.0
                 toi = api_stats["toi"] if api_stats else 17.0
-
                 pp_unit = pp_assignment.get(name.lower(), 0)
-                # Estimate PP TOI based on unit
                 pp_toi = 2.5 if pp_unit == 1 else 1.2 if pp_unit == 2 else 0.0
 
                 players[name] = {
-                    "season": season_sog,
-                    "l10": season_sog,      # Will need manual override or game log calc
-                    "toi": toi,
-                    "toi_trend": "stable",  # Would need multi-game history to calculate
-                    "pp": pp_unit,
-                    "pp_toi": pp_toi,
-                    "team": team_abbr,
-                    "pos": pos,
-                    "home": is_home,
-                    "b2b": False,           # Would need schedule cross-reference
+                    "season": season_sog, "l10": season_sog,
+                    "toi": toi, "toi_trend": "stable",
+                    "pp": pp_unit, "pp_toi": pp_toi,
+                    "team": team_abbr, "pos": pos,
+                    "home": is_home, "b2b": False,
                     "home_sog": round(season_sog * 1.05, 1),
                     "away_sog": round(season_sog * 0.95, 1),
                 }
@@ -299,61 +295,46 @@ def build_player_data(games, lines_data, goalie_data, team_stats_data):
 # ── Main ───────────────────────────────────────────────────────────────────────
 def run():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    print(f"\n=== NHL Scraper running for {today} ===\n")
+    print(f"\n=== NHL Scraper {today} ===\n")
 
-    # 1. Get tonight's schedule
     games = get_tonight_games()
     if not games:
-        print("No games found tonight.")
-        output = {"date": today, "games": [], "players": {}, "goalie_vs": {}, "shots_against": {}, "error": "No games tonight"}
-        (DATA_DIR / "today.json").write_text(json.dumps(output, indent=2))
-        return
+        out = {"date": today, "games": [], "players": {}, "goalie_vs": {}, "shots_against": {}, "error": "No games tonight"}
+        (DATA_DIR / "today.json").write_text(json.dumps(out, indent=2))
+        print("No games — saved empty result")
+        return out
 
-    # 2. Get team stats + goalie data for all teams playing
     all_teams = list({g["away"] for g in games} | {g["home"] for g in games})
-    print(f"\nFetching team stats for: {all_teams}")
-
     goalie_data = {}
     shots_against = {}
+
     for team in all_teams:
-        print(f"\n{team}:")
+        print(f"\n--- {team} ---")
         goalie_data[team] = get_goalie_stats(team)
         shots_against[team] = get_team_stats(team)
 
-    # goalie_vs: for each team, the SV% of the goalie they're SHOOTING AGAINST tonight
     goalie_vs = {}
     for g in games:
-        # Away team shoots against home goalie
         goalie_vs[g["away"]] = goalie_data[g["home"]]["save_pct"]
-        # Home team shoots against away goalie
         goalie_vs[g["home"]] = goalie_data[g["away"]]["save_pct"]
 
-    # 3. Scrape DailyFaceoff for lines + PP units
-    print(f"\nScraping DailyFaceoff lines...")
-    lines_data = {}
-    for team in all_teams:
-        lines_data[team] = scrape_dailyfaceoff_lines(team)
+    print(f"\n--- Scraping DailyFaceoff ---")
+    lines_data = {team: scrape_dailyfaceoff_lines(team) for team in all_teams}
 
-    # 4. Build player data
-    print(f"\nBuilding player data...")
-    players = build_player_data(games, lines_data, goalie_data, shots_against)
+    print(f"\n--- Building player data ---")
+    players = build_player_data(games, lines_data, goalie_data)
 
-    # 5. Format games for the app
     app_games = []
     for g in games:
-        # Convert UTC time to readable ET
         try:
             dt = datetime.fromisoformat(g["time"].replace("Z", "+00:00"))
-            # Simple UTC-5 offset for ET
             hour = (dt.hour - 5) % 24
             ampm = "PM" if hour >= 12 else "AM"
-            hour12 = hour % 12 or 12
-            time_str = f"{hour12}:00 {ampm}"
+            time_str = f"{hour % 12 or 12}:{str(dt.minute).zfill(2)} {ampm}"
         except:
-            time_str = g["time"]
+            time_str = "TBD"
         app_games.append({"away": g["away"], "home": g["home"], "time": time_str})
 
-    # 6. Save output
     output = {
         "date": today,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
@@ -362,17 +343,12 @@ def run():
         "goalie_vs": goalie_vs,
         "goalie_details": goalie_data,
         "shots_against": shots_against,
-        "scrape_status": {
-            team: lines_data[team].get("raw_html_ok", False)
-            for team in all_teams
-        }
+        "scrape_status": {t: lines_data[t].get("raw_html_ok", False) for t in all_teams},
     }
 
-    out_path = DATA_DIR / "today.json"
-    out_path.write_text(json.dumps(output, indent=2))
-    print(f"\n✓ Saved to {out_path}")
-    print(f"  {len(players)} players, {len(app_games)} games")
-    print(f"  Scrape success: {output['scrape_status']}")
+    (DATA_DIR / "today.json").write_text(json.dumps(output, indent=2))
+    print(f"\n✓ Done — {len(players)} players, {len(app_games)} games")
+    return output
 
 
 if __name__ == "__main__":
