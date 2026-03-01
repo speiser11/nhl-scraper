@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🏒 NHL Ladder Model v2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=JetBrains+Mono:wght@400;500&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #080c10; color: #c8dce8; font-family: 'Barlow', sans-serif; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-thumb { background: #1a2d42; border-radius: 2px; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes spin { to{transform:rotate(360deg)} }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .spin-anim { animation: spin 1s linear infinite; }
+  .pulse-anim { animation: pulse 2s ease infinite; }
+  .fadein-anim { animation: fadeIn 0.4s ease both; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useEffect } = React;
+
+const MODEL = "claude-sonnet-4-5";
+const TODAY = new Date().toISOString().split("T")[0];
+const SCRAPER_URL = "https://nhl-model.up.railway.app";
+const GIST_URL = "https://gist.githubusercontent.com/speiser11/13567175e73ed44d0c8d071f242ac40a/raw/nhl-today.json";
+
+const C = {
+  bg: "#080c10", surface: "#0d1520", card: "#111c2a", border: "#1a2d42",
+  accent: "#00e5ff", gold: "#f5c842", green: "#2ecc71", red: "#e74c3c",
+  muted: "#4a6a85", text: "#c8dce8", textBright: "#e8f4fc", purple: "#a855f7",
+};
+
+// ── Scoring Engine ─────────────────────────────────────────────────────────────
+function scorePlayer(name, playerData, goalieVs, shotsAgainst) {
+  const p = playerData[name];
+  if (!p) return null;
+  const gsv = goalieVs[p.team] || 0.910;
+  const opp = shotsAgainst[p.team] || 29.0;
+  const contextSog = p.home ? (p.home_sog || p.season) : (p.away_sog || p.season);
+  const trendDelta = (p.l10 || p.season) - p.season;
+  const trendScore   = Math.min(10, Math.max(0, 5 + trendDelta * 4));
+  const matchupScore = Math.min(10, Math.max(0, (0.930 - gsv) / 0.005));
+  const volumeScore  = Math.min(10, Math.max(0, (opp - 25) * 0.8));
+  const ppTOIScore   = Math.min(10, Math.max(0, ((p.pp_toi || 0) / 3.5) * 10));
+  const homeBonus    = p.home ? 0.8 : 0;
+  const b2bPenalty   = p.b2b ? -1.2 : 0;
+  const toiBonus     = p.toi_trend === "up" ? 0.8 : p.toi_trend === "down" ? -0.8 : 0;
+  const volumeBase   = Math.min(10, Math.max(0, (contextSog - 1.5) * 4));
+  const edgeRaw = trendScore*0.28 + matchupScore*0.26 + volumeScore*0.14 + ppTOIScore*0.15 + volumeBase*0.12 + homeBonus + b2bPenalty + toiBonus;
+  const edgeRounded = Math.round(Math.min(10, Math.max(1, edgeRaw)) * 10) / 10;
+  const matchupComposite = matchupScore * 0.6 + volumeScore * 0.4;
+  const grade = matchupComposite >= 6.5 ? "A" : matchupComposite >= 4.0 ? "B" : "C";
+  const flags = [];
+  if (p.b2b) flags.push("B2B");
+  if (!p.home) flags.push("AWAY");
+  if ((p.pp_toi || 0) >= 2.8) flags.push("PP-HEAVY");
+  if (trendDelta > 0.8) flags.push("HOT");
+  if (trendDelta < -0.8) flags.push("COLD");
+  return { ...p, name, edge: edgeRounded, grade, contextSog, flags };
+}
+
+function buildScoredPlayerData(playerData, goalieVs, shotsAgainst) {
+  const lines = ["PRE-SCORED PLAYER DATA — use Edge and Grade values EXACTLY as shown:", "Name | Team | Pos | CtxSOG | L10 | TOI | PP_TOI | Home | B2B | Edge | Grade | Flags", ""];
+  for (const name of Object.keys(playerData)) {
+    const s = scorePlayer(name, playerData, goalieVs, shotsAgainst);
+    if (!s) continue;
+    lines.push(`${name} | ${s.team} | ${s.pos} | ${s.contextSog} | ${s.l10||s.season} | ${s.toi}min | ${s.pp_toi||0}min PP | ${s.home?"HOME":"AWAY"} | ${s.b2b?"B2B":"-"} | Edge:${s.edge} | Grade:${s.grade} | ${s.flags.length?s.flags.join(","):"-"}`);
+  }
+  return lines.join("\n");
+}
+
+function buildAnalysisPrompt(games) {
+  const gameStr = games.map(g => `${g.away}@${g.home} ${g.time}`).join(", ");
+  return `You are an NHL betting analyst. Tonight: ${gameStr}.
+
+You receive pre-scored player data. Edge (1-10) and Grade (A/B/C) are computed from: L10 trend (28%), goalie SV% (26%), shots-against (14%), PP TOI (15%), home/away split (12%), B2B penalty, TOI trend. COPY THESE EXACT VALUES — do not estimate or change them.
+
+RULES:
+- 4 combos required: one SOG, one POINTS, one GOALS, one COMBO
+- 2 OR 3 players per combo — pick the best count
+- Cross-game combos encouraged — players need not be in the same game
+- List all games involved in the games field
+- No more than 2 combos sharing the same game
+- EXPOSURE LIMIT: no player in more than 2 of the 4 combos — count and enforce before output
+- Penalize B2B players unless Edge is still strong
+- Home players preferred over away at equal Edge
+- PP_TOI > 2.5min is a meaningful advantage
+
+SOG odds: 2+=-220, 3+=-110, 4+=+200, 5+=+400
+Points: 1+=-130, 2+=+260, 3+=+500. Goals: 1g=+130, 2g=+500
+EV = (implied_prob * decimal_odds) - 1, as %.
+
+Output ONLY these blocks, nothing outside them:
+
+COMBO_START
+type: SOG
+title: Title Here
+games: AWAY@HOME
+rationale: One sentence.
+edge_score: 8.1
+matchup_notes: One sentence on goalies/pace.
+player: Player Name|TEAM|POS|ctx_sog|l10|toi|toi_trend|pp_unit|grade
+rung1_threshold: Description
+rung1_conf: 62
+rung1_odds: +140
+rung1_ev: 5.8
+rung1_note: Brief note
+rung2_threshold: Description
+rung2_conf: 38
+rung2_odds: +420
+rung2_ev: 8.2
+rung2_note: Brief note
+rung3_threshold: Description
+rung3_conf: 18
+rung3_odds: +1100
+rung3_ev: 9.8
+rung3_note: Brief note
+COMBO_END
+
+Player format: Name|TEAM|POS|context_sog|l10_avg|toi_avg|toi_trend|pp_unit|grade
+edge_score = average of player Edge values. Use exact Grade from pre-scored data.`;
+}
+
+const CONVERT_PROMPT = `Convert this combo block to JSON. Output ONLY valid JSON starting with { — no markdown, no preamble.
+
+Player format: Name|TEAM|POS|context_sog|l10_avg|toi_avg|toi_trend|pp_unit|grade
+
+Required structure:
+{"title":"","type":"","games":[""],"rationale":"","edge_score":0,"matchup_notes":"","players":[{"name":"","team":"","position":"","season_avg":0,"l10_avg":0,"toi_avg":0,"toi_trend":"","pp_unit":0,"matchup_grade":""}],"rungs":[{"threshold":"","confidence_pct":0,"odds_estimate":"","ev":0,"note":""},{"threshold":"","confidence_pct":0,"odds_estimate":"","ev":0,"note":""},{"threshold":"","confidence_pct":0,"odds_estimate":"","ev":0,"note":""}]}`;
+
+// ── API ────────────────────────────────────────────────────────────────────────
+async function callAPI(system, userContent, prefill, onTick) {
+  const messages = [{ role: "user", content: userContent }];
+  if (prefill) messages.push({ role: "assistant", content: prefill });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  const start = Date.now();
+  const tick = onTick ? setInterval(() => onTick(Math.floor((Date.now()-start)/1000)), 1000) : null;
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST", signal: controller.signal,
+      headers: { "Content-Type": "application/json", "anthropic-dangerous-direct-browser-access": "true" },
+      body: JSON.stringify({ model: MODEL, max_tokens: prefill ? 1000 : 3000, system, messages }),
+    });
+    clearTimeout(timeout); if (tick) clearInterval(tick);
+    const data = await res.json();
+    if (!res.ok) throw new Error(`API ${res.status}: ${data?.error?.message}`);
+    const text = data.content?.[0]?.text || "";
+    return prefill ? prefill + text : text;
+  } catch(e) {
+    clearTimeout(timeout); if (tick) clearInterval(tick);
+    if (e.name === "AbortError") throw new Error("Timed out after 60s — try again");
+    throw e;
+  }
+}
+
+async function fetchLiveData() {
+  const res = await fetch(GIST_URL + "?t=" + Date.now());
+  if (!res.ok) throw new Error(`Gist fetch failed: ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  if (!data.players || Object.keys(data.players).length === 0) throw new Error("No player data");
+  return data;
+}
+
+// ── Storage (localStorage for standalone HTML) ─────────────────────────────────
+function loadDayPicks(date) {
+  try { const v = localStorage.getItem(`nhl:picks:${date}`); return v ? JSON.parse(v) : null; } catch { return null; }
+}
+function saveDayPicks(date, payload) {
+  localStorage.setItem(`nhl:picks:${date}`, JSON.stringify(payload));
+}
+function loadLog() {
+  try { const v = localStorage.getItem("nhl:results-log"); return v ? JSON.parse(v) : []; } catch { return []; }
+}
+function saveLog(log) {
+  localStorage.setItem("nhl:results-log", JSON.stringify(log));
+}
+
+// ── UI Primitives ──────────────────────────────────────────────────────────────
+function Badge({ label, color = C.accent }) {
+  return <span style={{ display:"inline-block", padding:"2px 8px", borderRadius:3, fontSize:10, fontWeight:700, letterSpacing:1, fontFamily:"'Barlow Condensed',sans-serif", background:color+"22", color, border:`1px solid ${color}44`, textTransform:"uppercase" }}>{label}</span>;
+}
+
+function ConfidenceBar({ pct, color }) {
+  return <div style={{ height:4, background:C.border, borderRadius:2, overflow:"hidden", flex:1 }}><div style={{ height:"100%", width:`${pct}%`, background:color, borderRadius:2, transition:"width 0.6s ease" }}/></div>;
+}
+
+function LadderRung({ rung, index, result }) {
+  const colors = [C.green, C.gold, C.accent];
+  const units = [0.7, 0.2, 0.1];
+  const labels = ["BASE","MID","STRETCH"];
+  const color = colors[index];
+  const conf = Math.max(5, [rung.confidence_pct, rung.confidence_pct-20, rung.confidence_pct-38][index] || 30);
+  const resultColor = result==="hit"?C.green:result==="miss"?C.red:result==="push"?C.gold:null;
+  return (
+    <div style={{ padding:"12px 14px", background:C.bg, borderRadius:6, border:`1px solid ${resultColor||color}33`, display:"flex", flexDirection:"column", gap:8 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <Badge label={labels[index]} color={color}/>
+          <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:14, color:C.textBright }}>{rung.threshold}</span>
+          {result && <Badge label={result.toUpperCase()} color={resultColor}/>}
+        </div>
+        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, color, padding:"2px 8px", background:color+"18", borderRadius:3 }}>{units[index]}u</span>
+      </div>
+      <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+        <ConfidenceBar pct={conf} color={resultColor||color}/>
+        <span style={{ fontSize:11, fontFamily:"'JetBrains Mono',monospace", color:C.muted, whiteSpace:"nowrap" }}>{conf}%</span>
+      </div>
+      <div style={{ fontSize:11, color:C.muted, fontFamily:"'JetBrains Mono',monospace", display:"flex", gap:12, flexWrap:"wrap" }}>
+        {rung.odds_estimate && <span>odds: <span style={{color}}>{rung.odds_estimate}</span></span>}
+        {rung.ev!=null && <span>EV: <span style={{color:rung.ev>0?C.green:C.red}}>{rung.ev>0?"+":""}{rung.ev}%</span></span>}
+        {rung.note && <span style={{color:C.muted}}>· {rung.note}</span>}
+      </div>
+    </div>
+  );
+}
+
+function PlayerRow({ player }) {
+  const trendUp = player.l10_avg > player.season_avg;
+  const toiColor = player.toi_trend==="up"?C.green:player.toi_trend==="down"?C.red:C.muted;
+  const toiArrow = player.toi_trend==="up"?"▲":player.toi_trend==="down"?"▼":"—";
+  return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"8px 12px", background:C.bg, borderRadius:4, border:`1px solid ${C.border}`, gap:12 }}>
+      <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+        <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:14, color:C.textBright }}>{player.name}</span>
+        <span style={{ fontSize:11, color:C.muted }}>{player.team} · {player.position}</span>
+      </div>
+      <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
+        <div style={{ textAlign:"center" }}><div style={{ fontSize:9, color:C.muted }}>CTX</div><div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:13, color:C.text }}>{player.season_avg}</div></div>
+        <div style={{ textAlign:"center" }}><div style={{ fontSize:9, color:C.muted }}>L10</div><div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:13, color:trendUp?C.green:C.red, fontWeight:600 }}>{trendUp?"▲":"▼"} {player.l10_avg}</div></div>
+        {player.toi_avg>0 && <div style={{ textAlign:"center" }}><div style={{ fontSize:9, color:C.muted }}>TOI</div><div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:13, color:toiColor, fontWeight:600 }}>{toiArrow} {player.toi_avg}</div></div>}
+        {player.pp_unit>0 && <Badge label={`PP${player.pp_unit}`} color={player.pp_unit===1?C.gold:C.muted}/>}
+        {player.matchup_grade && <Badge label={player.matchup_grade} color={player.matchup_grade==="A"?C.green:player.matchup_grade==="B"?C.gold:C.muted}/>}
+      </div>
+    </div>
+  );
+}
+
+// ── Results Log ────────────────────────────────────────────────────────────────
+function ResultEntry({ entry, onUpdate }) {
+  const [open, setOpen] = useState(false);
+  const graded = entry.combos.filter(c => c.result && c.result!=="pending").length;
+  const hits = entry.combos.filter(c => c.result==="hit").length;
+  const profit = entry.combos.reduce((s,c) => s+(c.result==="hit"?0.7:c.result==="miss"?-0.7:0), 0);
+  return (
+    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:8, overflow:"hidden" }}>
+      <div onClick={()=>setOpen(o=>!o)} style={{ padding:"12px 16px", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:15, color:C.textBright }}>{entry.date}</span>
+          <Badge label={`${hits}/${graded} hit`} color={hits>=graded/2?C.green:C.red}/>
+          {graded<entry.combos.length && <Badge label={`${entry.combos.length-graded} pending`} color={C.muted}/>}
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:12, color:profit>0?C.green:profit<0?C.red:C.muted }}>{profit>0?"+":""}{profit.toFixed(2)}u</span>
+          <span style={{ color:C.muted }}>{open?"▲":"▼"}</span>
+        </div>
+      </div>
+      {open && (
+        <div style={{ borderTop:`1px solid ${C.border}`, padding:"12px 16px", display:"flex", flexDirection:"column", gap:10 }}>
+          {entry.combos.map((combo, ci) => (
+            <div key={ci} style={{ padding:"10px 14px", background:C.bg, borderRadius:6, border:`1px solid ${C.border}` }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  <Badge label={combo.type} color={combo.type==="SOG"?C.accent:combo.type==="POINTS"?C.gold:combo.type==="GOALS"?C.green:C.purple}/>
+                  <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:13, color:C.textBright }}>{combo.title}</span>
+                </div>
+                <div style={{ display:"flex", gap:5 }}>
+                  {["hit","miss","push","pending"].map(r => (
+                    <button key={r} onClick={()=>onUpdate(entry.date,ci,r)}
+                      style={{ padding:"3px 8px", borderRadius:3, border:`1px solid ${combo.result===r?(r==="hit"?C.green:r==="miss"?C.red:r==="push"?C.gold:C.muted):C.border}`, background:combo.result===r?(r==="hit"?C.green+"22":r==="miss"?C.red+"22":r==="push"?C.gold+"22":"transparent"):"transparent", color:combo.result===r?(r==="hit"?C.green:r==="miss"?C.red:r==="push"?C.gold:C.muted):C.muted, cursor:"pointer", fontSize:10, fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600 }}>
+                      {r.toUpperCase()}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ fontSize:11, color:C.muted }}>Players: {(combo.players||[]).map(p=>p.name).join(", ")}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResultsPanel({ log, onUpdate, onClose }) {
+  const allCombos = log.flatMap(e=>e.combos);
+  const graded = allCombos.filter(c=>c.result&&c.result!=="pending");
+  const hits = graded.filter(c=>c.result==="hit").length;
+  const totalProfit = log.reduce((s,e)=>s+e.combos.reduce((ss,c)=>ss+(c.result==="hit"?0.7:c.result==="miss"?-0.7:0),0),0);
+  const hitRate = graded.length ? Math.round(hits/graded.length*100) : 0;
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:100, display:"flex", alignItems:"flex-start", justifyContent:"center", overflowY:"auto", padding:"24px 16px" }}>
+      <div style={{ width:"100%", maxWidth:700, background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, overflow:"hidden" }}>
+        <div style={{ padding:"16px 20px", borderBottom:`1px solid ${C.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div>
+            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:20, color:C.textBright }}>📊 RESULTS LOG</div>
+            <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>{log.length} days · {graded.length} combos graded</div>
+          </div>
+          <button onClick={onClose} style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.muted, borderRadius:4, padding:"4px 12px", cursor:"pointer", fontSize:12 }}>CLOSE</button>
+        </div>
+        <div style={{ padding:"14px 20px", borderBottom:`1px solid ${C.border}`, display:"flex", gap:24, flexWrap:"wrap" }}>
+          {[{label:"HIT RATE",value:`${hitRate}%`,color:hitRate>=55?C.green:hitRate>=45?C.gold:C.red},{label:"TOTAL P/L",value:`${totalProfit>0?"+":""}${totalProfit.toFixed(2)}u`,color:totalProfit>0?C.green:totalProfit<0?C.red:C.muted},{label:"GRADED",value:`${hits}/${graded.length}`,color:C.text},{label:"DAYS",value:log.length,color:C.muted}].map(s=>(
+            <div key={s.label}><div style={{ fontSize:10, color:C.muted, fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:1 }}>{s.label}</div><div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:22, color:s.color }}>{s.value}</div></div>
+          ))}
+        </div>
+        <div style={{ padding:"16px 20px", display:"flex", flexDirection:"column", gap:10, maxHeight:"60vh", overflowY:"auto" }}>
+          {log.length===0 && <div style={{ textAlign:"center", padding:"40px", color:C.muted, fontSize:13 }}>No results yet.</div>}
+          {[...log].reverse().map((entry,i)=><ResultEntry key={entry.date+i} entry={entry} onUpdate={onUpdate}/>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Combo Card ─────────────────────────────────────────────────────────────────
+function ComboCard({ combo, logResult }) {
+  const [expanded, setExpanded] = useState(false);
+  const typeColors = { SOG:C.accent, POINTS:C.gold, GOALS:C.green, COMBO:C.purple };
+  const color = typeColors[combo.type] || C.accent;
+  return (
+    <div className="fadein-anim" style={{ background:C.card, border:`1px solid ${C.border}`, borderLeft:`3px solid ${color}`, borderRadius:8, overflow:"hidden" }}>
+      <div onClick={()=>setExpanded(e=>!e)} style={{ padding:"16px 20px", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12 }}>
+        <div style={{ display:"flex", flexDirection:"column", gap:8, flex:1 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+            <Badge label={combo.type} color={color}/>
+            {(combo.games||[]).map(g=><Badge key={g} label={g} color={C.muted}/>)}
+            {combo.edge_score>0 && <Badge label={`EDGE ${combo.edge_score}/10`} color={combo.edge_score>=8?C.green:combo.edge_score>=6?C.gold:C.muted}/>}
+            {logResult && <Badge label={logResult.toUpperCase()} color={logResult==="hit"?C.green:logResult==="miss"?C.red:C.gold}/>}
+          </div>
+          <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:20, color:C.textBright }}>{combo.title}</div>
+          <div style={{ fontSize:12, color:C.muted, lineHeight:1.6 }}>{combo.rationale}</div>
+        </div>
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6, flexShrink:0 }}>
+          <span style={{ fontSize:18, color:C.muted }}>{expanded?"▲":"▼"}</span>
+          <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:C.muted }}>1.0u total</span>
+        </div>
+      </div>
+      {expanded && (
+        <div style={{ borderTop:`1px solid ${C.border}`, padding:"16px 20px", display:"flex", flexDirection:"column", gap:14 }}>
+          {combo.players?.length>0 && (
+            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+              <div style={{ fontSize:10, color:C.muted, letterSpacing:1, textTransform:"uppercase", fontFamily:"'Barlow Condensed',sans-serif" }}>Players</div>
+              {combo.players.map(p=><PlayerRow key={p.name} player={p}/>)}
+            </div>
+          )}
+          {combo.rungs?.length>0 && (
+            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+              <div style={{ fontSize:10, color:C.muted, letterSpacing:1, textTransform:"uppercase", fontFamily:"'Barlow Condensed',sans-serif" }}>Ladder Rungs</div>
+              {combo.rungs.map((r,i)=><LadderRung key={i} rung={r} index={i} result={combo.rungResults?.[i]}/>)}
+            </div>
+          )}
+          {combo.matchup_notes && (
+            <div style={{ padding:"10px 14px", background:C.bg, borderRadius:6, border:`1px solid ${C.border}`, fontSize:12, color:C.muted, lineHeight:1.6 }}>
+              <span style={{color:C.accent,fontWeight:600}}>📋 </span>{combo.matchup_notes}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────────
+function NHLBetModel() {
+  const [data, setData]         = useState(null);
+  const [liveData, setLiveData] = useState(null);
+  const [loading, setLoading]   = useState(false);
+  const [fetching, setFetching] = useState(true);
+  const [error, setError]       = useState(null);
+  const [scraperError, setScraperError] = useState(null);
+  const [status, setStatus]     = useState("");
+  const [filter, setFilter]     = useState("ALL");
+  const [logOpen, setLogOpen]   = useState(false);
+  const [log, setLog]           = useState([]);
+
+  useEffect(() => {
+    const todayPicks = loadDayPicks(TODAY);
+    const resultLog = loadLog();
+    if (todayPicks) setData(todayPicks);
+    setLog(resultLog || []);
+
+    fetchLiveData()
+      .then(live => { setLiveData(live); setScraperError(null); })
+      .catch(e => setScraperError(e.message))
+      .finally(() => setFetching(false));
+  }, []);
+
+  const runModel = useCallback(async () => {
+    if (!liveData) { setError("No live data from scraper."); return; }
+    if (data?.locked) {
+      if (!window.confirm("Today's picks are already locked. Re-running will overwrite them. Continue?")) return;
+    }
+    setLoading(true); setError(null);
+    try {
+      const { players: playerData, goalie_vs: goalieVs, shots_against: shotsAgainst, games } = liveData;
+      setStatus("Step 1/2: Analyzing tonight's slate... (0s)");
+      const scoredData = buildScoredPlayerData(playerData, goalieVs, shotsAgainst);
+      const analysisPrompt = buildAnalysisPrompt(games);
+      const analysisText = await callAPI(analysisPrompt, scoredData, null, secs => setStatus(`Step 1/2: Analyzing tonight's slate... (${secs}s)`));
+      const blocks = [...analysisText.matchAll(/COMBO_START([\s\S]*?)COMBO_END/g)].map(m=>m[1].trim());
+      if (!blocks.length) { setError("No combos found. Raw: " + analysisText.slice(0,300)); return; }
+      const combos = [];
+      for (let ci=0; ci<blocks.length; ci++) {
+        setStatus(`Step 2/2: Converting combo ${ci+1} of ${blocks.length}... (0s)`);
+        try {
+          const jsonText = await callAPI(CONVERT_PROMPT, blocks[ci], "{", secs => setStatus(`Step 2/2: Converting combo ${ci+1} of ${blocks.length}... (${secs}s)`));
+          const match = jsonText.match(/\{[\s\S]*\}/);
+          if (match) combos.push(JSON.parse(match[0]));
+        } catch(e) { if (e.message.includes("Timed out")) throw e; }
+      }
+      if (!combos.length) { setError("Could not parse any combos. Try again."); return; }
+      const playerCount = {};
+      for (const c of combos) for (const p of (c.players||[])) playerCount[p.name]=(playerCount[p.name]||0)+1;
+      for (const c of combos) {
+        c._exposureWarning = (c.players||[]).filter(p=>playerCount[p.name]>2).map(p=>p.name);
+        c.result = "pending";
+        c.rungResults = ["pending","pending","pending"];
+      }
+      const payload = { date:TODAY, locked:true, lockedAt:new Date().toISOString(), scraperDate:liveData.date, combos };
+      saveDayPicks(TODAY, payload);
+      const existingLog = loadLog();
+      if (!existingLog.some(e=>e.date===TODAY)) {
+        const newLog = [...existingLog, { date:TODAY, combos:combos.map(c=>({...c})) }];
+        saveLog(newLog); setLog(newLog);
+      }
+      setData(payload); setStatus("");
+    } catch(e) { setError(`Error: ${e.message}`); } finally { setLoading(false); }
+  }, [data, liveData]);
+
+  const handleUpdateResult = useCallback((date, comboIndex, result) => {
+    const newLog = log.map(entry => entry.date!==date ? entry : { ...entry, combos:entry.combos.map((c,ci)=>ci!==comboIndex?c:{...c,result}) });
+    setLog(newLog); saveLog(newLog);
+    if (date===TODAY && data) {
+      const newData = { ...data, combos:data.combos.map((c,ci)=>ci!==comboIndex?c:{...c,result}) };
+      setData(newData); saveDayPicks(TODAY, newData);
+    }
+  }, [log, data]);
+
+  const filtered = (data?.combos||[]).filter(c=>filter==="ALL"||c.type===filter);
+  const todayInLog = log.find(e=>e.date===TODAY);
+  const tonightGames = liveData?.games || [];
+  const dateLabel = new Date().toLocaleDateString("en-US", {month:"short", day:"numeric", year:"numeric"});
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, paddingBottom:60 }}>
+      {logOpen && <ResultsPanel log={log} onUpdate={handleUpdateResult} onClose={()=>setLogOpen(false)}/>}
+
+      {/* Header */}
+      <div style={{ background:`linear-gradient(180deg,${C.surface} 0%,${C.bg} 100%)`, borderBottom:`1px solid ${C.border}`, padding:"0 24px" }}>
+        <div style={{ maxWidth:860, margin:"0 auto", padding:"20px 0 16px" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", flexWrap:"wrap", gap:12 }}>
+            <div>
+              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:900, fontSize:28, color:C.textBright, letterSpacing:1 }}>
+                🏒 NHL LADDER MODEL <span style={{ fontSize:14, color:C.muted, fontWeight:400 }}>v2</span>
+              </div>
+              <div style={{ fontSize:11, color:C.muted, marginTop:3, fontFamily:"'JetBrains Mono',monospace" }}>
+                {dateLabel} · {fetching ? "fetching live data..." : liveData ? `✓ live data loaded (${Object.keys(liveData.players||{}).length} players)` : "⚠ scraper offline"}
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+              <button onClick={()=>setLogOpen(true)} style={{ padding:"8px 14px", background:"transparent", color:C.muted, border:`1px solid ${C.border}`, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:13 }}>
+                📊 LOG {log.length>0?`(${log.length}d)`:""}
+              </button>
+              <button onClick={runModel} disabled={loading||fetching} style={{ padding:"9px 20px", background:loading||fetching?C.border:data?.locked?"transparent":C.accent, color:loading||fetching?C.muted:data?.locked?C.gold:C.bg, border:data?.locked?`1px solid ${C.gold}44`:"none", borderRadius:5, cursor:loading||fetching?"not-allowed":"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:13, display:"flex", alignItems:"center", gap:7 }}>
+                {loading ? <span>⟳ Analyzing...</span>
+                : fetching ? "Loading data..."
+                : data?.locked ? "🔒 RE-RUN TODAY"
+                : "▶ RUN MODEL"}
+              </button>
+            </div>
+          </div>
+
+          {scraperError && (
+            <div style={{ marginTop:8, padding:"6px 12px", background:C.red+"12", border:`1px solid ${C.red}33`, borderRadius:5, fontSize:11, color:C.red, fontFamily:"'JetBrains Mono',monospace" }}>
+              ⚠ Scraper offline: {scraperError} — visit <a href={SCRAPER_URL+"/refresh"} target="_blank" style={{color:C.red}}>{SCRAPER_URL}/refresh</a> to wake it up
+            </div>
+          )}
+          {data?.locked && (
+            <div style={{ marginTop:8, padding:"6px 12px", background:C.green+"12", border:`1px solid ${C.green}33`, borderRadius:5, fontSize:11, color:C.green, fontFamily:"'JetBrains Mono',monospace", display:"inline-flex", alignItems:"center", gap:6 }}>
+              🔒 Locked {new Date(data.lockedAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})} · Official picks for {data.date}
+            </div>
+          )}
+
+          {tonightGames.length > 0 && (
+            <div style={{ marginTop:12, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(185px,1fr))", gap:8 }}>
+              {tonightGames.map(g=>(
+                <div key={g.home} style={{ padding:"9px 13px", background:C.card, border:`1px solid ${C.border}`, borderRadius:6, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:14, color:C.textBright }}>{g.away} <span style={{color:C.muted,fontWeight:400}}>@</span> {g.home}</span>
+                  <span style={{ fontSize:11, color:C.muted, fontFamily:"'JetBrains Mono',monospace" }}>{g.time}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {liveData?.goalie_details && Object.keys(liveData.goalie_details).length > 0 && (
+            <div style={{ marginTop:10, padding:"10px 14px", background:C.surface, border:`1px solid ${C.border}`, borderRadius:8 }}>
+              <div style={{ fontSize:10, color:C.muted, letterSpacing:1, fontFamily:"'Barlow Condensed',sans-serif", marginBottom:8 }}>TONIGHT'S GOALIES (LIVE)</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:10 }}>
+                {Object.entries(liveData.goalie_details).map(([team, g]) => (
+                  <div key={team} style={{ display:"flex", alignItems:"center", gap:8, padding:"5px 10px", background:C.card, borderRadius:5, border:`1px solid ${C.border}` }}>
+                    <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:13, color:C.accent }}>{team}</span>
+                    <span style={{ fontSize:12, color:C.text }}>{g.name}</span>
+                    <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:g.save_pct<=0.905?C.green:g.save_pct>=0.920?C.red:C.gold }}>{g.save_pct?.toFixed(3)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ maxWidth:860, margin:"0 auto", padding:"20px 24px 0" }}>
+        <div style={{ display:"flex", gap:10, marginBottom:14, padding:"9px 14px", background:C.surface, border:`1px solid ${C.border}`, borderRadius:8, flexWrap:"wrap", alignItems:"center" }}>
+          <span style={{ fontSize:10, color:C.muted, fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:1 }}>EDGE:</span>
+          {[{l:"L10 Trend",w:"28%",c:C.accent},{l:"Opp SV%",w:"26%",c:C.gold},{l:"PP TOI",w:"15%",c:C.green},{l:"SA/g",w:"14%",c:C.purple},{l:"H/A Split",w:"12%",c:C.text},{l:"B2B·TOI",w:"5%",c:C.muted}].map(x=>(
+            <div key={x.l} style={{ display:"flex", alignItems:"center", gap:4, fontSize:11 }}>
+              <div style={{ width:7,height:7,borderRadius:2,background:x.c }}/>
+              <span style={{ color:x.c,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:600 }}>{x.l}</span>
+              <span style={{ color:C.muted,fontFamily:"'JetBrains Mono',monospace",fontSize:10 }}>{x.w}</span>
+            </div>
+          ))}
+        </div>
+
+        {!data && !loading && !error && (
+          <div style={{ textAlign:"center", padding:"36px 20px 28px", border:`1px dashed ${C.border}`, borderRadius:12, background:C.surface }}>
+            <div style={{ fontSize:40, marginBottom:12 }}>🏒</div>
+            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:24, fontWeight:700, color:C.textBright, marginBottom:8 }}>NHL Parlay Ladder Model v2</div>
+            <div style={{ fontSize:13, color:C.muted, maxWidth:420, margin:"0 auto 20px", lineHeight:1.8 }}>
+              {fetching ? "Fetching tonight's live data..."
+              : liveData ? `Live data ready — ${Object.keys(liveData.players).length} players across ${liveData.games.length} games.`
+              : "Scraper offline — visit Railway /refresh to wake it up."}
+            </div>
+            <button onClick={runModel} disabled={loading||fetching||!liveData}
+              style={{ padding:"11px 26px", background:!liveData||fetching?C.border:C.accent, color:!liveData||fetching?C.muted:C.bg, border:"none", borderRadius:6, cursor:!liveData||fetching?"not-allowed":"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:15, letterSpacing:1 }}>
+              {fetching?"Loading...":"▶ RUN TODAY'S MODEL"}
+            </button>
+          </div>
+        )}
+
+        {loading && (
+          <div style={{ textAlign:"center", padding:"70px 20px" }}>
+            <div style={{ display:"inline-flex", flexDirection:"column", alignItems:"center", gap:14 }}>
+              <div className="spin-anim" style={{ width:42,height:42,border:`3px solid ${C.border}`,borderTopColor:C.accent,borderRadius:"50%"}}/>
+              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:17, color:C.text }}>{status}</div>
+              {["Scoring players with live data","Checking B2B and home/away splits","Analysing PP TOI and goalie SV%","Building ladder rungs","Converting to structured picks"].map(s=>(
+                <div key={s} className="pulse-anim" style={{ fontSize:11,color:C.muted,fontFamily:"'JetBrains Mono',monospace"}}>› {s}</div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {error && !loading && (
+          <div style={{ padding:"14px 18px", background:C.red+"18", border:`1px solid ${C.red}44`, borderRadius:8, color:C.red, fontSize:13, lineHeight:1.6 }}>⚠ {error}</div>
+        )}
+
+        {data && !loading && (
+          <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
+            <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+              {["ALL","SOG","POINTS","GOALS","COMBO"].map(f=>(
+                <button key={f} onClick={()=>setFilter(f)} style={{ padding:"5px 13px", borderRadius:4, border:`1px solid ${filter===f?C.accent:C.border}`, background:filter===f?C.accent+"18":"transparent", color:filter===f?C.accent:C.muted, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:12, letterSpacing:1 }}>{f}</button>
+              ))}
+              <span style={{ marginLeft:"auto", fontSize:11, color:C.muted, fontFamily:"'JetBrains Mono',monospace" }}>{filtered.length} combo{filtered.length!==1?"s":""} · click to expand</span>
+            </div>
+            {filtered.map((combo,i)=>{
+              const logEntry = todayInLog?.combos?.[data.combos.indexOf(combo)];
+              return <ComboCard key={combo.title+i} combo={combo} logResult={logEntry?.result}/>;
+            })}
+            <div style={{ padding:"9px 13px", background:C.surface, border:`1px solid ${C.border}`, borderRadius:6, fontSize:11, color:C.muted, lineHeight:1.7 }}>
+              <span style={{color:C.gold}}>⚠ </span>Verify odds on your book. Confirm lines on DailyFaceoff. Not financial advice.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<NHLBetModel/>);
+</script>
+</body>
+</html>
