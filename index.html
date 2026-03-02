@@ -92,7 +92,7 @@ function buildMatchupContext(games, nstStats) {
   return lines.join("\n");
 }
 
-function buildAnalysisPrompt(games) {
+function buildAnalysisPrompt(games, oddsSection) {
   const gameStr = games.map(g => `${g.away}@${g.home} ${g.time}`).join(", ");
   return `You are an NHL betting analyst. Tonight: ${gameStr}.
 
@@ -114,7 +114,6 @@ DEFENSEMEN NOTE: D-men (LD/RD) average 1.5–3.0 SOG/g vs forwards at 2.0–4.5+
 
 RULES:
 - Generate 3-6 combos total. ALWAYS include at least one SOG combo — it is required. For the remaining slots, only include a type if the data shows genuine edge. Do NOT force GOALS or POINTS just for variety.
-- COMBO type is allowed: a parlay mixing 2+ different prop types (e.g. one player SOG + another player to score). Must still be individual player props only.
 - 2 OR 3 players per combo — all must be individual player props from the list above
 - Cross-game combos encouraged — players need not be in the same game
 - List all games involved in the games field
@@ -124,9 +123,17 @@ RULES:
 - Home players preferred over away at equal Edge
 - PP_TOI > 2.5min is a meaningful advantage
 
-SOG odds: 2+=-220, 3+=-110, 4+=+200, 5+=+400
-Points: 1+=-130, 2+=+260, 3+=+500. Goals: 1g=+130, 2g=+500
-EV = (implied_prob * decimal_odds) - 1, as %.
+PARLAY LADDER STRUCTURE — every rung is a parlay of ALL players in the combo, thresholds escalate together:
+- Rung 1 (BASE): All players at their easiest threshold (e.g. Player A 2+ SOG + Player B 2+ SOG)
+- Rung 2 (MID): All players one step higher (e.g. Player A 3+ SOG + Player B 3+ SOG)
+- Rung 3 (STRETCH): All players at highest threshold (e.g. Player A 4+ SOG + Player B 4+ SOG)
+- The threshold field must list every player and their prop explicitly, e.g. "McDavid 2+ SOG + Draisaitl 2+ SOG"
+- Parlay odds = multiply decimal odds of each leg. Confidence drops at each rung.
+
+${oddsSection || ""}
+REFERENCE ODDS (fallback for players not in live odds above):
+SOG: 2+=-220, 3+=-110, 4+=+200, 5+=+400 | Points: 1+=-130, 2+=+260 | Goals: 1+= +130
+Parlay decimal odds = product of all legs. EV = (implied_prob * decimal_odds) - 1, as %.
 
 Output ONLY these blocks, nothing outside them:
 
@@ -137,20 +144,21 @@ games: AWAY@HOME
 rationale: One sentence.
 edge_score: 8.1
 matchup_notes: One sentence on goalies/pace.
-player: Player Name|TEAM|POS|ctx_sog|l10|toi|toi_trend|pp_unit|grade
-rung1_threshold: Description
-rung1_conf: 62
-rung1_odds: +140
+player: Player A|TEAM|POS|ctx_sog|l10|toi|toi_trend|pp_unit|grade
+player: Player B|TEAM|POS|ctx_sog|l10|toi|toi_trend|pp_unit|grade
+rung1_threshold: Player A 2+ SOG + Player B 2+ SOG
+rung1_conf: 36
+rung1_odds: +280
 rung1_ev: 5.8
 rung1_note: Brief note
-rung2_threshold: Description
-rung2_conf: 38
-rung2_odds: +420
+rung2_threshold: Player A 3+ SOG + Player B 3+ SOG
+rung2_conf: 18
+rung2_odds: +900
 rung2_ev: 8.2
 rung2_note: Brief note
-rung3_threshold: Description
-rung3_conf: 18
-rung3_odds: +1100
+rung3_threshold: Player A 4+ SOG + Player B 4+ SOG
+rung3_conf: 7
+rung3_odds: +3200
 rung3_ev: 9.8
 rung3_note: Brief note
 COMBO_END
@@ -199,6 +207,78 @@ async function fetchLiveData() {
   if (data.error) throw new Error(data.error);
   if (!data.players || Object.keys(data.players).length === 0) throw new Error("No player data");
   return data;
+}
+
+async function fetchOddsData(apiKey) {
+  const eventsRes = await fetch(`https://api.the-odds-api.com/v4/sports/icehockey_nhl/events?apiKey=${apiKey}&dateFormat=iso`);
+  if (!eventsRes.ok) throw new Error(`Odds API events error: ${eventsRes.status}`);
+  const events = await eventsRes.json();
+  if (!events.length) return {};
+
+  const oddsMap = {};
+  const MARKETS = "player_shots_on_goal,player_anytime_goal_scorer,player_points";
+
+  await Promise.all(events.map(async event => {
+    try {
+      const res = await fetch(`https://api.the-odds-api.com/v4/sports/icehockey_nhl/events/${event.id}/odds?apiKey=${apiKey}&regions=us&markets=${MARKETS}&oddsFormat=american`);
+      if (!res.ok) return;
+      const data = await res.json();
+      for (const bookmaker of (data.bookmakers || [])) {
+        for (const market of (bookmaker.markets || [])) {
+          const mtype = market.key === "player_shots_on_goal" ? "sog"
+            : market.key === "player_anytime_goal_scorer" ? "goals"
+            : market.key === "player_points" ? "points" : null;
+          if (!mtype) continue;
+          for (const outcome of (market.outcomes || [])) {
+            let player, threshold;
+            if (mtype === "goals") {
+              player = outcome.name;
+              threshold = "1+";
+            } else {
+              if (outcome.name !== "Over") continue;
+              player = outcome.description;
+              threshold = `${Math.round((outcome.point || 2.5) - 0.5)}+`;
+            }
+            if (!player) continue;
+            if (!oddsMap[player]) oddsMap[player] = {};
+            if (!oddsMap[player][mtype]) oddsMap[player][mtype] = {};
+            const existing = oddsMap[player][mtype][threshold];
+            if (existing === undefined || outcome.price > existing) {
+              oddsMap[player][mtype][threshold] = outcome.price;
+            }
+          }
+        }
+      }
+    } catch(e) { /* skip failed events */ }
+  }));
+
+  return oddsMap;
+}
+
+function buildOddsSection(oddsMap) {
+  if (!oddsMap || Object.keys(oddsMap).length === 0) return "";
+  const lines = ["\nLIVE ODDS (The Odds API — use these exact values for rung_odds, overriding reference values):"];
+  for (const [player, props] of Object.entries(oddsMap)) {
+    const parts = [];
+    if (props.sog && Object.keys(props.sog).length) {
+      const sogStr = Object.entries(props.sog)
+        .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
+        .map(([t, o]) => `${t}=${o > 0 ? "+" : ""}${o}`).join(", ");
+      parts.push(`SOG: ${sogStr}`);
+    }
+    if (props.goals && props.goals["1+"] !== undefined) {
+      const o = props.goals["1+"];
+      parts.push(`Goals: 1+=${o > 0 ? "+" : ""}${o}`);
+    }
+    if (props.points && Object.keys(props.points).length) {
+      const ptStr = Object.entries(props.points)
+        .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
+        .map(([t, o]) => `${t}=${o > 0 ? "+" : ""}${o}`).join(", ");
+      parts.push(`Points: ${ptStr}`);
+    }
+    if (parts.length) lines.push(`${player}: ${parts.join(" | ")}`);
+  }
+  return lines.join("\n");
 }
 
 // ── Storage (localStorage for standalone HTML) ─────────────────────────────────
@@ -434,11 +514,22 @@ function NHLBetModel() {
     setLoading(true); setError(null);
     try {
       const { players: playerData, goalie_vs: goalieVs, shots_against: shotsAgainst, games, nst_team_stats: nstStats } = liveData;
-      setStatus("Step 1/2: Analyzing tonight's slate... (0s)");
       const scoredData = buildScoredPlayerData(playerData, goalieVs, shotsAgainst);
       const matchupContext = buildMatchupContext(games, nstStats || {});
+
+      let oddsSection = "";
+      const oddsKey = localStorage.getItem("nhl_odds_api_key");
+      if (oddsKey) {
+        try {
+          setStatus("Fetching live odds...");
+          const oddsData = await fetchOddsData(oddsKey);
+          oddsSection = buildOddsSection(oddsData);
+        } catch(e) { console.warn("Odds fetch failed:", e.message); }
+      }
+
+      setStatus("Step 1/2: Analyzing tonight's slate... (0s)");
       const userMessage = scoredData + (matchupContext ? "\n" + matchupContext : "");
-      const analysisPrompt = buildAnalysisPrompt(games);
+      const analysisPrompt = buildAnalysisPrompt(games, oddsSection);
       const analysisText = await callAPI(analysisPrompt, userMessage, null, secs => setStatus(`Step 1/2: Analyzing tonight's slate... (${secs}s)`));
       const blocks = [...analysisText.matchAll(/COMBO_START([\s\S]*?)COMBO_END/g)].map(m=>m[1].trim());
       if (!blocks.length) { setError("No combos found. Raw: " + analysisText.slice(0,300)); return; }
@@ -496,9 +587,19 @@ function NHLBetModel() {
             <input id="claude-key-input" type="password" defaultValue={localStorage.getItem("nhl_claude_key")||""} placeholder="sk-ant-..."
               style={{ width:"100%", background:C.card, border:`1px solid ${C.border}`, color:C.text, padding:"10px 12px", borderRadius:6, fontFamily:"'JetBrains Mono',monospace", fontSize:12, marginBottom:6, outline:"none" }}/>
             <div style={{ fontSize:11, color:C.muted, marginBottom:20, lineHeight:1.6 }}>Stored locally in your browser only. Never sent anywhere except Anthropic's API.</div>
+            <div style={{ marginBottom:8, fontSize:11, color:C.muted, fontFamily:"'JetBrains Mono',monospace" }}>THE ODDS API KEY <span style={{color:C.muted,fontWeight:400}}>(optional — for live odds)</span></div>
+            <input id="odds-key-input" type="password" defaultValue={localStorage.getItem("nhl_odds_api_key")||""} placeholder="your-odds-api-key"
+              style={{ width:"100%", background:C.card, border:`1px solid ${C.border}`, color:C.text, padding:"10px 12px", borderRadius:6, fontFamily:"'JetBrains Mono',monospace", fontSize:12, marginBottom:6, outline:"none" }}/>
+            <div style={{ fontSize:11, color:C.muted, marginBottom:20, lineHeight:1.6 }}>Fetches real sportsbook odds for player props. Stored locally only.</div>
             <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
               <button onClick={()=>setSettingsOpen(false)} style={{ padding:"8px 16px", background:"transparent", border:`1px solid ${C.border}`, color:C.muted, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:12 }}>CANCEL</button>
-              <button onClick={()=>{ const k=document.getElementById("claude-key-input").value.trim(); if(k) localStorage.setItem("nhl_claude_key",k); else localStorage.removeItem("nhl_claude_key"); setSettingsOpen(false); }} style={{ padding:"8px 16px", background:C.accent, border:"none", color:C.bg, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:12 }}>SAVE</button>
+              <button onClick={()=>{
+                const k=document.getElementById("claude-key-input").value.trim();
+                if(k) localStorage.setItem("nhl_claude_key",k); else localStorage.removeItem("nhl_claude_key");
+                const ok=document.getElementById("odds-key-input").value.trim();
+                if(ok) localStorage.setItem("nhl_odds_api_key",ok); else localStorage.removeItem("nhl_odds_api_key");
+                setSettingsOpen(false);
+              }} style={{ padding:"8px 16px", background:C.accent, border:"none", color:C.bg, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:12 }}>SAVE</button>
             </div>
           </div>
         </div>
