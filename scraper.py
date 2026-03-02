@@ -222,6 +222,69 @@ def get_player_season_stats(player_name, team_abbr):
     return None
 
 
+# ── Natural Stat Trick ─────────────────────────────────────────────────────────
+NST_NAME_TO_ABBR = {
+    "anaheim ducks":"ANA","boston bruins":"BOS","buffalo sabres":"BUF",
+    "calgary flames":"CGY","carolina hurricanes":"CAR","chicago blackhawks":"CHI",
+    "colorado avalanche":"COL","columbus blue jackets":"CBJ","dallas stars":"DAL",
+    "detroit red wings":"DET","edmonton oilers":"EDM","florida panthers":"FLA",
+    "minnesota wild":"MIN","montreal canadiens":"MTL","nashville predators":"NSH",
+    "new jersey devils":"NJD","new york islanders":"NYI","new york rangers":"NYR",
+    "ottawa senators":"OTT","philadelphia flyers":"PHI","pittsburgh penguins":"PIT",
+    "san jose sharks":"SJS","seattle kraken":"SEA","st louis blues":"STL",
+    "tampa bay lightning":"TBL","toronto maple leafs":"TOR","utah mammoth":"UTA",
+    "vancouver canucks":"VAN","vegas golden knights":"VGK","washington capitals":"WSH",
+    "winnipeg jets":"WPG",
+}
+
+def get_nst_team_stats():
+    """Scrape SA/g, CF%, and xGF% for all teams from Natural Stat Trick."""
+    season = "20242025"
+    url = (f"https://www.naturalstattrick.com/teamtable.php"
+           f"?fromseason={season}&thruseason={season}&stype=2&sit=all"
+           f"&score=all&rate=n&team=all&loc=B&gpf=410&gpt=&fd=&td=")
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if not table:
+            print("  NST: table not found")
+            return {}
+
+        # Map header names to column indices
+        headers = [th.get_text(strip=True) for th in table.find("thead").find_all("th")]
+        idx = {h: i for i, h in enumerate(headers)}
+
+        out = {}
+        for row in table.find("tbody").find_all("tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            if not cells:
+                continue
+            team_name = cells[0].lower().strip()
+            abbr = NST_NAME_TO_ABBR.get(team_name)
+            if not abbr:
+                continue
+            try:
+                gp  = int(cells[idx["GP"]]) or 1
+                sa  = float(cells[idx["SA"]]) if "SA" in idx else 0
+                cf  = float(cells[idx["CF%"]]) if "CF%" in idx else 0
+                xgf = float(cells[idx["xGF%"]]) if "xGF%" in idx else 0
+                out[abbr] = {
+                    "sa_per_game": round(sa / gp, 1),
+                    "cf_pct":  cf,
+                    "xgf_pct": xgf,
+                }
+            except (ValueError, IndexError):
+                continue
+
+        print(f"  NST: loaded {len(out)} teams")
+        return out
+    except Exception as e:
+        print(f"  NST error: {e}")
+        return {}
+
+
 # ── DailyFaceoff scraper ───────────────────────────────────────────────────────
 def scrape_dailyfaceoff_lines(team_abbr):
     abbr_to_slug = {
@@ -365,12 +428,14 @@ def run():
 
     all_teams = list({g["away"] for g in games} | {g["home"] for g in games})
     goalie_data = {}
-    shots_against = {}
 
     for team in all_teams:
         print(f"\n--- {team} ---")
         goalie_data[team] = get_goalie_stats(team)
-        shots_against[team] = get_team_stats(team)
+
+    print(f"\n--- Natural Stat Trick ---")
+    nst_stats = get_nst_team_stats()
+    shots_against = {t: nst_stats[t]["sa_per_game"] if t in nst_stats else DEFAULT_SHOTS_AGAINST for t in all_teams}
 
     goalie_vs = {}
     for g in games:
@@ -405,6 +470,7 @@ def run():
         "goalie_vs": goalie_vs,
         "goalie_details": goalie_data,
         "shots_against": shots_against,
+        "nst_team_stats": nst_stats,
         "scrape_status": {t: lines_data[t].get("raw_html_ok", False) for t in all_teams},
     }
 
