@@ -177,7 +177,7 @@ async function callAPI(system, userContent, prefill, onTick) {
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST", signal: controller.signal,
-      headers: { "Content-Type": "application/json", "anthropic-dangerous-direct-browser-access": "true", "x-api-key": localStorage.getItem("nhl_claude_key") || "" },
+      headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true", "x-api-key": localStorage.getItem("nhl_claude_key") || "" },
       body: JSON.stringify({ model: MODEL, max_tokens: prefill ? 1000 : 3000, system, messages }),
     });
     clearTimeout(timeout); if (tick) clearInterval(tick);
