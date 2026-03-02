@@ -72,18 +72,37 @@ def get_tonight_games():
 
 
 def get_team_stats(team_abbr):
-    """Shots-against per game from standings."""
+    """Shots-against per game — tries club-stats endpoint, falls back to standings."""
+    # Try the club-stats endpoint first
+    for endpoint in [f"club-stats/{team_abbr}/now", f"club-stats-season/{team_abbr}"]:
+        data = api_get(f"{NHL_API}/{endpoint}", endpoint)
+        if data:
+            for field in ["shotsAgainstPerGame", "shotsAgainst", "saPerGame", "sa"]:
+                val = data.get(field)
+                if val and float(val) > 15:
+                    result = round(float(val), 1)
+                    print(f"  {team_abbr} SA/g: {result}")
+                    return result
+
+    # Fall back to standings
     data = api_get(f"{NHL_API}/standings/now", "standings")
     if data:
         for team in data.get("standings", []):
             abbrev = safe_get(team, "teamAbbrev", "default") or team.get("teamAbbrev", "")
             if abbrev == team_abbr:
                 gp = team.get("gamesPlayed", 1) or 1
-                sa = team.get("shotsAgainst", None)
-                if sa:
-                    result = round(sa / gp, 1)
-                    print(f"  {team_abbr} SA/g: {result}")
-                    return result
+                for field in ["shotsAgainst", "shotsAgainstPerGame", "sa"]:
+                    val = team.get(field)
+                    if val:
+                        sa = float(val)
+                        result = sa if sa < 50 else round(sa / gp, 1)
+                        print(f"  {team_abbr} SA/g: {result} (standings/{field})")
+                        return result
+                # Debug: show shot-related keys so we can fix the field name if still failing
+                shot_keys = [k for k in team.keys() if any(x in k.lower() for x in ["shot", "sa", "sog"])]
+                print(f"  {team_abbr}: no SA/g field found. Available shot-related keys: {shot_keys}")
+                break
+
     print(f"  {team_abbr} SA/g: default {DEFAULT_SHOTS_AGAINST}")
     return DEFAULT_SHOTS_AGAINST
 
@@ -140,8 +159,21 @@ def get_goalie_stats(team_abbr):
     return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0}
 
 
+def get_player_l10_sog(pid):
+    """Average SOG over last 10 regular season games from game log."""
+    data = api_get(f"{NHL_API}/player/{pid}/game-log/now", f"gamelog/{pid}")
+    if not data:
+        return None
+    # gameTypeId 2 = regular season; log is newest-first
+    regular = [g for g in data.get("gameLog", []) if g.get("gameTypeId") == 2]
+    last10 = regular[:10]
+    if not last10:
+        return None
+    return round(sum(g.get("shots", 0) for g in last10) / len(last10), 1)
+
+
 def get_player_season_stats(player_name, team_abbr):
-    """Season SOG/g and TOI for a player."""
+    """Season SOG/g, L10 SOG/g, and TOI for a player."""
     data = api_get(f"{NHL_API}/roster/{team_abbr}/current", f"roster/{team_abbr}")
     if not data:
         return None
@@ -181,7 +213,9 @@ def get_player_season_stats(player_name, team_abbr):
             except:
                 toi_dec = 17.0
 
-            return {"season_sog": round(shots / gp, 1), "toi": round(toi_dec, 1), "gp": gp}
+            season_sog = round(shots / gp, 1)
+            l10_sog = get_player_l10_sog(pid)
+            return {"season_sog": season_sog, "l10_sog": l10_sog or season_sog, "toi": round(toi_dec, 1), "gp": gp}
 
     return None
 
@@ -255,7 +289,28 @@ def scrape_dailyfaceoff_lines(team_abbr):
 
 
 # ── Build player data ──────────────────────────────────────────────────────────
-def build_player_data(games, lines_data, goalie_data):
+def get_b2b_teams(games):
+    """Return set of team abbrevs playing back-to-back tonight."""
+    from datetime import timedelta
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    data = api_get(f"{NHL_API}/schedule/{yesterday}", "yesterday_schedule")
+    if not data:
+        return set()
+    played_yesterday = set()
+    for gw in data.get("gameWeek", []):
+        if gw.get("date") == yesterday:
+            for g in gw.get("games", []):
+                away = safe_get(g, "awayTeam", "abbrev", default="")
+                home = safe_get(g, "homeTeam", "abbrev", default="")
+                if away: played_yesterday.add(away)
+                if home: played_yesterday.add(home)
+    tonight_teams = {g["away"] for g in games} | {g["home"] for g in games}
+    b2b = played_yesterday & tonight_teams
+    print(f"  B2B teams tonight: {b2b if b2b else 'none'}")
+    return b2b
+
+
+def build_player_data(games, lines_data, goalie_data, b2b_teams):
     players = {}
     home_teams = {g["home"] for g in games}
 
@@ -276,16 +331,17 @@ def build_player_data(games, lines_data, goalie_data):
                     continue
                 api_stats = get_player_season_stats(name, team_abbr)
                 season_sog = api_stats["season_sog"] if api_stats else 2.0
+                l10_sog    = api_stats["l10_sog"]    if api_stats else season_sog
                 toi = api_stats["toi"] if api_stats else 17.0
                 pp_unit = pp_assignment.get(name.lower(), 0)
                 pp_toi = 2.5 if pp_unit == 1 else 1.2 if pp_unit == 2 else 0.0
 
                 players[name] = {
-                    "season": season_sog, "l10": season_sog,
+                    "season": season_sog, "l10": l10_sog,
                     "toi": toi, "toi_trend": "stable",
                     "pp": pp_unit, "pp_toi": pp_toi,
                     "team": team_abbr, "pos": pos,
-                    "home": is_home, "b2b": False,
+                    "home": is_home, "b2b": team_abbr in b2b_teams,
                     "home_sog": round(season_sog * 1.05, 1),
                     "away_sog": round(season_sog * 0.95, 1),
                 }
@@ -319,11 +375,14 @@ def run():
         goalie_vs[g["away"]] = goalie_data[g["home"]]["save_pct"]
         goalie_vs[g["home"]] = goalie_data[g["away"]]["save_pct"]
 
+    print(f"\n--- Checking B2B ---")
+    b2b_teams = get_b2b_teams(games)
+
     print(f"\n--- Scraping DailyFaceoff ---")
     lines_data = {team: scrape_dailyfaceoff_lines(team) for team in all_teams}
 
     print(f"\n--- Building player data ---")
-    players = build_player_data(games, lines_data, goalie_data)
+    players = build_player_data(games, lines_data, goalie_data, b2b_teams)
 
     app_games = []
     for g in games:
