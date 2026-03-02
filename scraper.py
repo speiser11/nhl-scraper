@@ -232,8 +232,8 @@ def scrape_dailyfaceoff_lines(team_abbr):
                     "lw": chunk[0], "c": chunk[1], "rw": chunk[2],
                 })
 
-        # PP units — look for section headings
-        pp_texts = soup.find_all(string=re.compile(r"Power Play|PP1|PP2", re.I))
+        # PP units — look for section headings ("1st Powerplay Unit", "2nd Powerplay Unit")
+        pp_texts = soup.find_all(string=re.compile(r"powerplay unit", re.I))
         pp_players_seen = []
         for pt in pp_texts[:2]:
             parent = pt.find_parent()
