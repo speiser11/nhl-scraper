@@ -76,11 +76,33 @@ function buildScoredPlayerData(playerData, goalieVs, shotsAgainst) {
   return lines.join("\n");
 }
 
+function buildMatchupContext(games, nstStats) {
+  if (!nstStats || Object.keys(nstStats).length === 0) return "";
+  const allTeams = [...new Set(games.flatMap(g => [g.away, g.home]))];
+  const lines = [
+    "\nTEAM ADVANCED STATS (Natural Stat Trick — all situations, current season):",
+    "Team | CF% | xGF% | SA/g",
+    "CF%>52=possession-heavy, <48=weak-possession. xGF%>52=high-expected-goals, <48=suppresses-offense.",
+  ];
+  for (const team of allTeams) {
+    const s = nstStats[team];
+    if (!s) continue;
+    lines.push(`${team} | CF%:${s.cf_pct} | xGF%:${s.xgf_pct} | SA/g:${s.sa_per_game}`);
+  }
+  return lines.join("\n");
+}
+
 function buildAnalysisPrompt(games) {
   const gameStr = games.map(g => `${g.away}@${g.home} ${g.time}`).join(", ");
   return `You are an NHL betting analyst. Tonight: ${gameStr}.
 
-You receive pre-scored player data. Edge (1-10) and Grade (A/B/C) are computed from: L10 trend (28%), goalie SV% (26%), shots-against (14%), PP TOI (15%), home/away split (12%), B2B penalty, TOI trend. COPY THESE EXACT VALUES — do not estimate or change them.
+You receive pre-scored player data plus team advanced stats. Edge (1-10) and Grade (A/B/C) are computed from: L10 trend (28%), goalie SV% (26%), shots-against (14%), PP TOI (15%), home/away split (12%), B2B penalty, TOI trend. COPY THESE EXACT VALUES — do not estimate or change them.
+
+TEAM ADVANCED STATS USAGE — CF% and xGF% from Natural Stat Trick:
+- A player's team CF%>52 means their team controls puck possession (more offensive zone time, more shot opportunities).
+- The opponent's CF%<48 means they struggle to generate shots — favorable for the player facing them.
+- xGF%>52 means a team creates higher-quality scoring chances; xGF%<48 means they suppress offense well.
+- Use these to adjust confidence on SOG props: favor players whose team has high CF%/xGF% OR who face an opponent with low CF%/xGF%.
 
 PROP TYPES — only use props that exist on major sportsbooks:
 - SOG: individual player shots on goal (2+, 3+, 4+, 5+)
@@ -409,11 +431,13 @@ function NHLBetModel() {
     }
     setLoading(true); setError(null);
     try {
-      const { players: playerData, goalie_vs: goalieVs, shots_against: shotsAgainst, games } = liveData;
+      const { players: playerData, goalie_vs: goalieVs, shots_against: shotsAgainst, games, nst_team_stats: nstStats } = liveData;
       setStatus("Step 1/2: Analyzing tonight's slate... (0s)");
       const scoredData = buildScoredPlayerData(playerData, goalieVs, shotsAgainst);
+      const matchupContext = buildMatchupContext(games, nstStats || {});
+      const userMessage = scoredData + (matchupContext ? "\n" + matchupContext : "");
       const analysisPrompt = buildAnalysisPrompt(games);
-      const analysisText = await callAPI(analysisPrompt, scoredData, null, secs => setStatus(`Step 1/2: Analyzing tonight's slate... (${secs}s)`));
+      const analysisText = await callAPI(analysisPrompt, userMessage, null, secs => setStatus(`Step 1/2: Analyzing tonight's slate... (${secs}s)`));
       const blocks = [...analysisText.matchAll(/COMBO_START([\s\S]*?)COMBO_END/g)].map(m=>m[1].trim());
       if (!blocks.length) { setError("No combos found. Raw: " + analysisText.slice(0,300)); return; }
       const combos = [];
