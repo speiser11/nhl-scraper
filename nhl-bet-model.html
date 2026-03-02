@@ -146,7 +146,7 @@ async function callAPI(system, userContent, prefill, onTick) {
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST", signal: controller.signal,
-      headers: { "Content-Type": "application/json", "anthropic-dangerous-direct-browser-access": "true" },
+      headers: { "Content-Type": "application/json", "anthropic-dangerous-direct-browser-access": "true", "x-api-key": localStorage.getItem("nhl_claude_key") || "" },
       body: JSON.stringify({ model: MODEL, max_tokens: prefill ? 1000 : 3000, system, messages }),
     });
     clearTimeout(timeout); if (tick) clearInterval(tick);
@@ -378,8 +378,9 @@ function NHLBetModel() {
   const [scraperError, setScraperError] = useState(null);
   const [status, setStatus]     = useState("");
   const [filter, setFilter]     = useState("ALL");
-  const [logOpen, setLogOpen]   = useState(false);
-  const [log, setLog]           = useState([]);
+  const [logOpen, setLogOpen]       = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [log, setLog]               = useState([]);
 
   useEffect(() => {
     const todayPicks = loadDayPicks(TODAY);
@@ -394,6 +395,7 @@ function NHLBetModel() {
   }, []);
 
   const runModel = useCallback(async () => {
+    if (!localStorage.getItem("nhl_claude_key")) { setSettingsOpen(true); setError("Add your Anthropic API key in settings first."); return; }
     if (!liveData) { setError("No live data from scraper."); return; }
     if (data?.locked) {
       if (!window.confirm("Today's picks are already locked. Re-running will overwrite them. Continue?")) return;
@@ -453,6 +455,22 @@ function NHLBetModel() {
     <div style={{ minHeight:"100vh", background:C.bg, paddingBottom:60 }}>
       {logOpen && <ResultsPanel log={log} onUpdate={handleUpdateResult} onClose={()=>setLogOpen(false)}/>}
 
+      {settingsOpen && (
+        <div onClick={()=>setSettingsOpen(false)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:100, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <div onClick={e=>e.stopPropagation()} style={{ width:"90%", maxWidth:420, background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, padding:24 }}>
+            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:20, color:C.textBright, marginBottom:16 }}>⚙ SETTINGS</div>
+            <div style={{ marginBottom:8, fontSize:11, color:C.muted, fontFamily:"'JetBrains Mono',monospace" }}>ANTHROPIC API KEY</div>
+            <input id="claude-key-input" type="password" defaultValue={localStorage.getItem("nhl_claude_key")||""} placeholder="sk-ant-..."
+              style={{ width:"100%", background:C.card, border:`1px solid ${C.border}`, color:C.text, padding:"10px 12px", borderRadius:6, fontFamily:"'JetBrains Mono',monospace", fontSize:12, marginBottom:6, outline:"none" }}/>
+            <div style={{ fontSize:11, color:C.muted, marginBottom:20, lineHeight:1.6 }}>Stored locally in your browser only. Never sent anywhere except Anthropic's API.</div>
+            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
+              <button onClick={()=>setSettingsOpen(false)} style={{ padding:"8px 16px", background:"transparent", border:`1px solid ${C.border}`, color:C.muted, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:12 }}>CANCEL</button>
+              <button onClick={()=>{ const k=document.getElementById("claude-key-input").value.trim(); if(k) localStorage.setItem("nhl_claude_key",k); else localStorage.removeItem("nhl_claude_key"); setSettingsOpen(false); }} style={{ padding:"8px 16px", background:C.accent, border:"none", color:C.bg, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:12 }}>SAVE</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div style={{ background:`linear-gradient(180deg,${C.surface} 0%,${C.bg} 100%)`, borderBottom:`1px solid ${C.border}`, padding:"0 24px" }}>
         <div style={{ maxWidth:860, margin:"0 auto", padding:"20px 0 16px" }}>
@@ -468,6 +486,9 @@ function NHLBetModel() {
             <div style={{ display:"flex", gap:8, alignItems:"center" }}>
               <button onClick={()=>setLogOpen(true)} style={{ padding:"8px 14px", background:"transparent", color:C.muted, border:`1px solid ${C.border}`, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:13 }}>
                 📊 LOG {log.length>0?`(${log.length}d)`:""}
+              </button>
+              <button onClick={()=>setSettingsOpen(true)} style={{ padding:"8px 14px", background:"transparent", color:localStorage.getItem("nhl_claude_key")?C.muted:C.red, border:`1px solid ${localStorage.getItem("nhl_claude_key")?C.border:C.red+"66"}`, borderRadius:5, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:600, fontSize:13 }}>
+                ⚙ {localStorage.getItem("nhl_claude_key")?"SETTINGS":"ADD KEY"}
               </button>
               <button onClick={runModel} disabled={loading||fetching} style={{ padding:"9px 20px", background:loading||fetching?C.border:data?.locked?"transparent":C.accent, color:loading||fetching?C.muted:data?.locked?C.gold:C.bg, border:data?.locked?`1px solid ${C.gold}44`:"none", borderRadius:5, cursor:loading||fetching?"not-allowed":"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:13, display:"flex", alignItems:"center", gap:7 }}>
                 {loading ? <span>⟳ Analyzing...</span>
