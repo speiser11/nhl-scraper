@@ -77,8 +77,10 @@ def get_team_stats(team_abbr):
     for endpoint in [f"club-stats/{team_abbr}/now", f"club-stats-season/{team_abbr}"]:
         data = api_get(f"{NHL_API}/{endpoint}", endpoint)
         if data:
+            # Response may be a dict or a list — normalize to dict
+            d = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else {}
             for field in ["shotsAgainstPerGame", "shotsAgainst", "saPerGame", "sa"]:
-                val = data.get(field)
+                val = d.get(field)
                 if val and float(val) > 15:
                     result = round(float(val), 1)
                     print(f"  {team_abbr} SA/g: {result}")
