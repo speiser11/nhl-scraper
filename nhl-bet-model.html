@@ -29,7 +29,6 @@ const { useState, useCallback, useEffect } = React;
 
 const MODEL = "claude-sonnet-4-5";
 const TODAY = new Date().toISOString().split("T")[0];
-const SCRAPER_URL = "https://nhl-model.up.railway.app";
 const GIST_URL = "https://gist.githubusercontent.com/speiser11/13567175e73ed44d0c8d071f242ac40a/raw/nhl-today.json";
 
 const C = {
@@ -463,7 +462,7 @@ function NHLBetModel() {
                 🏒 NHL LADDER MODEL <span style={{ fontSize:14, color:C.muted, fontWeight:400 }}>v2</span>
               </div>
               <div style={{ fontSize:11, color:C.muted, marginTop:3, fontFamily:"'JetBrains Mono',monospace" }}>
-                {dateLabel} · {fetching ? "fetching live data..." : liveData ? `✓ live data loaded (${Object.keys(liveData.players||{}).length} players)` : "⚠ scraper offline"}
+                {dateLabel} · {fetching ? "fetching live data..." : liveData ? `✓ live data loaded (${Object.keys(liveData.players||{}).length} players)` : "⚠ no data yet today"}
               </div>
             </div>
             <div style={{ display:"flex", gap:8, alignItems:"center" }}>
@@ -481,7 +480,7 @@ function NHLBetModel() {
 
           {scraperError && (
             <div style={{ marginTop:8, padding:"6px 12px", background:C.red+"12", border:`1px solid ${C.red}33`, borderRadius:5, fontSize:11, color:C.red, fontFamily:"'JetBrains Mono',monospace" }}>
-              ⚠ Scraper offline: {scraperError} — visit <a href={SCRAPER_URL+"/refresh"} target="_blank" style={{color:C.red}}>{SCRAPER_URL}/refresh</a> to wake it up
+              ⚠ Data unavailable: {scraperError} — the GitHub Action may not have run yet today
             </div>
           )}
           {data?.locked && (
@@ -538,7 +537,7 @@ function NHLBetModel() {
             <div style={{ fontSize:13, color:C.muted, maxWidth:420, margin:"0 auto 20px", lineHeight:1.8 }}>
               {fetching ? "Fetching tonight's live data..."
               : liveData ? `Live data ready — ${Object.keys(liveData.players).length} players across ${liveData.games.length} games.`
-              : "Scraper offline — visit Railway /refresh to wake it up."}
+              : "Data unavailable — the GitHub Action may not have run yet today."}
             </div>
             <button onClick={runModel} disabled={loading||fetching||!liveData}
               style={{ padding:"11px 26px", background:!liveData||fetching?C.border:C.accent, color:!liveData||fetching?C.muted:C.bg, border:"none", borderRadius:6, cursor:!liveData||fetching?"not-allowed":"pointer", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:15, letterSpacing:1 }}>
