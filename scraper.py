@@ -232,9 +232,10 @@ NST_NAME_TO_ABBR = {
     "new jersey devils":"NJD","new york islanders":"NYI","new york rangers":"NYR",
     "ottawa senators":"OTT","philadelphia flyers":"PHI","pittsburgh penguins":"PIT",
     "san jose sharks":"SJS","seattle kraken":"SEA","st louis blues":"STL",
-    "tampa bay lightning":"TBL","toronto maple leafs":"TOR","utah mammoth":"UTA",
+    "tampa bay lightning":"TBL","toronto maple leafs":"TOR",
+    "utah mammoth":"UTA","utah hockey club":"UTA",
     "vancouver canucks":"VAN","vegas golden knights":"VGK","washington capitals":"WSH",
-    "winnipeg jets":"WPG",
+    "winnipeg jets":"WPG","los angeles kings":"LAK",
 }
 
 def get_nst_team_stats():
@@ -257,11 +258,19 @@ def get_nst_team_stats():
         idx = {h: i for i, h in enumerate(headers)}
 
         out = {}
-        for row in table.find("tbody").find_all("tr"):
+        tbody = table.find("tbody")
+        if not tbody:
+            print("  NST: no tbody found, trying all rows")
+            rows = table.find_all("tr")[1:]  # skip header
+        else:
+            rows = tbody.find_all("tr")
+        for i, row in enumerate(rows):
             cells = [td.get_text(strip=True) for td in row.find_all("td")]
             if not cells:
                 continue
             team_name = cells[0].lower().strip()
+            if i < 3:
+                print(f"  NST debug row {i}: '{team_name}' ({len(cells)} cols)")
             abbr = NST_NAME_TO_ABBR.get(team_name)
             if not abbr:
                 continue
