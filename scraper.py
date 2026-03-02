@@ -353,10 +353,6 @@ def run():
     return output
 
 
-if __name__ == "__main__":
-    run()
-
-
 def push_to_gist(data):
     """Update the GitHub Gist with today's scraped data."""
     import os
@@ -378,3 +374,7 @@ def push_to_gist(data):
             print(f"  ✗ Gist update failed: {r.status_code} {r.text[:200]}")
     except Exception as e:
         print(f"  ✗ Gist push error: {e}")
+
+
+if __name__ == "__main__":
+    run()
