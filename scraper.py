@@ -240,10 +240,13 @@ NST_NAME_TO_ABBR = {
 
 def get_nst_team_stats():
     """Scrape SA/g, CF%, and xGF% for all teams from Natural Stat Trick."""
-    season = "20242025"
+    now = datetime.now(timezone.utc)
+    year = now.year
+    season = f"{year}{year+1}" if now.month >= 10 else f"{year-1}{year}"
     url = (f"https://www.naturalstattrick.com/teamtable.php"
            f"?fromseason={season}&thruseason={season}&stype=2&sit=all"
-           f"&score=all&rate=n&team=all&loc=B&gpf=410&gpt=&fd=&td=")
+           f"&score=all&rate=n&team=all&loc=B&gpf=&gpt=&fd=&td=")
+    print(f"  NST URL: {url}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -253,25 +256,30 @@ def get_nst_team_stats():
             print("  NST: table not found")
             return {}
 
-        # Map header names to column indices
-        headers = [th.get_text(strip=True) for th in table.find("thead").find_all("th")]
+        # Find headers — th's are inside tr inside thead, not direct children of thead
+        header_row = table.find("thead").find("tr") if table.find("thead") else None
+        if not header_row:
+            print("  NST: no header row found")
+            return {}
+        headers = [th.get_text(strip=True) for th in header_row.find_all("th")]
+        print(f"  NST headers ({len(headers)}): {headers[:10]}")
         idx = {h: i for i, h in enumerate(headers)}
 
         out = {}
         tbody = table.find("tbody")
-        if not tbody:
-            print("  NST: no tbody found, trying all rows")
-            rows = table.find_all("tr")[1:]  # skip header
-        else:
-            rows = tbody.find_all("tr")
+        rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
         for i, row in enumerate(rows):
-            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            cells = [td.get_text(strip=True) for td in row.find_all("td", recursive=False)]
             if not cells:
                 continue
-            team_name = cells[0].lower().strip()
             if i < 3:
-                print(f"  NST debug row {i}: '{team_name}' ({len(cells)} cols)")
-            abbr = NST_NAME_TO_ABBR.get(team_name)
+                print(f"  NST debug row {i}: {cells[:5]} ({len(cells)} cols)")
+            # Find team name — search cells for a known team name
+            team_name = None
+            team_col = idx.get("Team", 1)
+            if team_col < len(cells):
+                team_name = cells[team_col].lower().strip()
+            abbr = NST_NAME_TO_ABBR.get(team_name) if team_name else None
             if not abbr:
                 continue
             try:
