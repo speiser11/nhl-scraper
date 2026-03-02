@@ -10,6 +10,11 @@ import re
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo
+    _CT = ZoneInfo("America/Chicago")
+except Exception:
+    _CT = None
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 HEADERS = {
@@ -109,14 +114,15 @@ def get_team_stats(team_abbr):
     return DEFAULT_SHOTS_AGAINST
 
 
-def get_goalie_stats(team_abbr):
-    """Best goalie SV% from roster + player landing pages."""
+def get_goalie_stats(team_abbr, confirmed_name=None):
+    """Best goalie SV% from roster. Uses confirmed_name if provided, else most-games-played."""
     data = api_get(f"{NHL_API}/roster/{team_abbr}/current", f"roster/{team_abbr}")
     if not data:
-        return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0}
+        return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0, "confirmed": False}
 
     best = None
     best_gp = 0
+    confirmed_result = None
 
     for g in data.get("goalies", []):
         pid = g.get("id")
@@ -126,13 +132,11 @@ def get_goalie_stats(team_abbr):
         if not sdata:
             continue
 
-        # Try multiple key paths for season stats
         sub = (
             safe_get(sdata, "featuredStats", "regularSeason", "subSeason") or
             safe_get(sdata, "last5Games", 0) or
             {}
         )
-        # Also check seasonTotals array
         if not sub:
             totals = sdata.get("seasonTotals", [])
             for t in totals:
@@ -149,16 +153,25 @@ def get_goalie_stats(team_abbr):
 
         print(f"  {team_abbr} goalie candidate: {name} GP={gp} SV%={svp}")
 
+        if confirmed_name and svp is not None and not confirmed_result:
+            if (lname.lower() == confirmed_name.lower().split()[-1] or
+                    name.lower() == confirmed_name.lower()):
+                confirmed_result = {"name": name, "save_pct": round(float(svp), 3), "gp": gp, "confirmed": True}
+
         if gp > best_gp and svp is not None:
             best_gp = gp
-            best = {"name": name, "save_pct": round(float(svp), 3), "gp": gp}
+            best = {"name": name, "save_pct": round(float(svp), 3), "gp": gp, "confirmed": False}
+
+    if confirmed_result:
+        print(f"  {team_abbr} goalie: CONFIRMED {confirmed_result['name']} {confirmed_result['save_pct']}")
+        return confirmed_result
 
     if best:
         print(f"  {team_abbr} goalie selected: {best['name']} {best['save_pct']}")
         return best
 
     print(f"  {team_abbr} goalie: default")
-    return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0}
+    return {"name": "Unknown", "save_pct": DEFAULT_SAVE_PCT, "gp": 0, "confirmed": False}
 
 
 def get_player_l10_sog(pid):
@@ -303,6 +316,65 @@ def get_nst_team_stats():
 
 
 # ── DailyFaceoff scraper ───────────────────────────────────────────────────────
+def scrape_confirmed_goalies():
+    """Scrape DailyFaceoff starting goalies page. Returns {team_abbr: {"name":..., "confirmed":bool}}."""
+    url = "https://www.dailyfaceoff.com/starting-goalies/"
+    SLUG_TO_ABBR = {
+        "anaheim-ducks":"ANA","boston-bruins":"BOS","buffalo-sabres":"BUF",
+        "calgary-flames":"CGY","carolina-hurricanes":"CAR","chicago-blackhawks":"CHI",
+        "colorado-avalanche":"COL","columbus-blue-jackets":"CBJ","dallas-stars":"DAL",
+        "detroit-red-wings":"DET","edmonton-oilers":"EDM","florida-panthers":"FLA",
+        "minnesota-wild":"MIN","montreal-canadiens":"MTL","nashville-predators":"NSH",
+        "new-jersey-devils":"NJD","new-york-islanders":"NYI","new-york-rangers":"NYR",
+        "ottawa-senators":"OTT","philadelphia-flyers":"PHI","pittsburgh-penguins":"PIT",
+        "san-jose-sharks":"SJS","seattle-kraken":"SEA","st-louis-blues":"STL",
+        "tampa-bay-lightning":"TBL","toronto-maple-leafs":"TOR","utah-mammoth":"UTA",
+        "vancouver-canucks":"VAN","vegas-golden-knights":"VGK","washington-capitals":"WSH",
+        "winnipeg-jets":"WPG",
+    }
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        result = {}
+
+        # Find team links, then walk up to find the game card containing goalie info
+        team_links = soup.find_all("a", href=re.compile(r"/teams/[\w-]+/"))
+        print(f"  Goalie page: {len(team_links)} team links found")
+
+        for tlink in team_links:
+            href = tlink.get("href", "")
+            m = re.search(r"/teams/([\w-]+)/", href)
+            if not m:
+                continue
+            slug = m.group(1)
+            abbr = SLUG_TO_ABBR.get(slug)
+            if not abbr or abbr in result:
+                continue
+
+            # Walk up from the team link to find a container that also has a player (goalie) link
+            container = tlink.find_parent()
+            for _ in range(10):
+                if not container or container.name in ("body", "html"):
+                    break
+                goalie_link = container.find("a", href=re.compile(r"/players/"))
+                if goalie_link:
+                    name = goalie_link.get_text(strip=True)
+                    if name and len(name) > 3:
+                        text = container.get_text(separator=" ")
+                        is_confirmed = bool(re.search(r"\bconfirmed\b", text, re.I))
+                        result[abbr] = {"name": name, "confirmed": is_confirmed}
+                        break
+                container = container.find_parent()
+
+        summary = [f"{k}:{v['name']}" + (" ✓" if v["confirmed"] else "") for k, v in result.items()]
+        print(f"  Starting goalies: {', '.join(summary) if summary else 'none found'}")
+        return result
+    except Exception as e:
+        print(f"  Goalie page error: {e}")
+        return {}
+
+
 def scrape_dailyfaceoff_lines(team_abbr):
     abbr_to_slug = {
         "ANA": "anaheim-ducks", "BOS": "boston-bruins", "BUF": "buffalo-sabres",
@@ -329,7 +401,7 @@ def scrape_dailyfaceoff_lines(team_abbr):
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        result = {"lines": [], "pp_units": [], "raw_html_ok": True}
+        result = {"lines": [], "d_pairs": [], "pp_units": [], "raw_html_ok": True}
 
         # Grab all player links — DailyFaceoff player links contain /players/
         player_links = soup.find_all("a", href=re.compile(r"/players/"))
@@ -348,6 +420,15 @@ def scrape_dailyfaceoff_lines(team_abbr):
                     "lw": chunk[0], "c": chunk[1], "rw": chunk[2],
                 })
 
+        # Links 12-17 = 3 defensive pairs of 2
+        for i in range(12, min(len(seen), 18), 2):
+            chunk = seen[i:i+2]
+            if len(chunk) == 2:
+                result["d_pairs"].append({
+                    "pair": len(result["d_pairs"]) + 1,
+                    "ld": chunk[0], "rd": chunk[1],
+                })
+
         # PP units — look for section headings ("1st Powerplay Unit", "2nd Powerplay Unit")
         pp_texts = soup.find_all(string=re.compile(r"powerplay unit", re.I))
         pp_players_seen = []
@@ -362,7 +443,7 @@ def scrape_dailyfaceoff_lines(team_abbr):
                 result["pp_units"].append({"unit": unit_num, "players": names[:5]})
                 pp_players_seen.extend(names[:5])
 
-        print(f"  {team_abbr}: {len(result['lines'])} lines, {len(result['pp_units'])} PP units")
+        print(f"  {team_abbr}: {len(result['lines'])} lines, {len(result['d_pairs'])} D-pairs, {len(result['pp_units'])} PP units")
         return result
 
     except Exception as e:
@@ -407,26 +488,33 @@ def build_player_data(games, lines_data, goalie_data, b2b_teams):
                 if name and name.strip():
                     pp_assignment[name.strip().lower()] = pp["unit"]
 
-        for line in team_lines.get("lines", []):
-            for pos, name in [("LW", line.get("lw")), ("C", line.get("c")), ("RW", line.get("rw"))]:
-                if not name or name in players:
-                    continue
-                api_stats = get_player_season_stats(name, team_abbr)
-                season_sog = api_stats["season_sog"] if api_stats else 2.0
-                l10_sog    = api_stats["l10_sog"]    if api_stats else season_sog
-                toi = api_stats["toi"] if api_stats else 17.0
-                pp_unit = pp_assignment.get(name.lower(), 0)
-                pp_toi = 2.5 if pp_unit == 1 else 1.2 if pp_unit == 2 else 0.0
+        skater_slots = (
+            [("LW", line.get("lw")) for line in team_lines.get("lines", [])] +
+            [("C",  line.get("c"))  for line in team_lines.get("lines", [])] +
+            [("RW", line.get("rw")) for line in team_lines.get("lines", [])] +
+            [("LD", pair.get("ld")) for pair in team_lines.get("d_pairs", [])] +
+            [("RD", pair.get("rd")) for pair in team_lines.get("d_pairs", [])]
+        )
+        for pos, name in skater_slots:
+            if not name or name in players:
+                continue
+            is_d = pos in ("LD", "RD")
+            api_stats = get_player_season_stats(name, team_abbr)
+            season_sog = api_stats["season_sog"] if api_stats else (1.5 if is_d else 2.0)
+            l10_sog    = api_stats["l10_sog"]    if api_stats else season_sog
+            toi        = api_stats["toi"]        if api_stats else (21.0 if is_d else 17.0)
+            pp_unit = pp_assignment.get(name.lower(), 0)
+            pp_toi = 2.5 if pp_unit == 1 else 1.2 if pp_unit == 2 else 0.0
 
-                players[name] = {
-                    "season": season_sog, "l10": l10_sog,
-                    "toi": toi, "toi_trend": "stable",
-                    "pp": pp_unit, "pp_toi": pp_toi,
-                    "team": team_abbr, "pos": pos,
-                    "home": is_home, "b2b": team_abbr in b2b_teams,
-                    "home_sog": round(season_sog * 1.05, 1),
-                    "away_sog": round(season_sog * 0.95, 1),
-                }
+            players[name] = {
+                "season": season_sog, "l10": l10_sog,
+                "toi": toi, "toi_trend": "stable",
+                "pp": pp_unit, "pp_toi": pp_toi,
+                "team": team_abbr, "pos": pos,
+                "home": is_home, "b2b": team_abbr in b2b_teams,
+                "home_sog": round(season_sog * 1.05, 1),
+                "away_sog": round(season_sog * 0.95, 1),
+            }
 
     return players
 
@@ -446,9 +534,13 @@ def run():
     all_teams = list({g["away"] for g in games} | {g["home"] for g in games})
     goalie_data = {}
 
+    print(f"\n--- Confirmed Goalies ---")
+    confirmed_goalies = scrape_confirmed_goalies()
+
     for team in all_teams:
         print(f"\n--- {team} ---")
-        goalie_data[team] = get_goalie_stats(team)
+        conf_name = confirmed_goalies.get(team, {}).get("name")
+        goalie_data[team] = get_goalie_stats(team, confirmed_name=conf_name)
 
     print(f"\n--- Natural Stat Trick ---")
     nst_stats = get_nst_team_stats()
@@ -472,9 +564,14 @@ def run():
     for g in games:
         try:
             dt = datetime.fromisoformat(g["time"].replace("Z", "+00:00"))
-            hour = (dt.hour - 5) % 24
-            ampm = "PM" if hour >= 12 else "AM"
-            time_str = f"{hour % 12 or 12}:{str(dt.minute).zfill(2)} {ampm}"
+            if _CT:
+                dt_loc = dt.astimezone(_CT)
+                h, m = dt_loc.hour, dt_loc.minute
+            else:
+                h = (dt.hour - 6) % 24  # rough CST fallback
+                m = dt.minute
+            ampm = "PM" if h >= 12 else "AM"
+            time_str = f"{h % 12 or 12}:{str(m).zfill(2)} {ampm} CT"
         except:
             time_str = "TBD"
         app_games.append({"away": g["away"], "home": g["home"], "time": time_str})

@@ -105,10 +105,12 @@ TEAM ADVANCED STATS USAGE — CF% and xGF% from Natural Stat Trick:
 - Use these to adjust confidence on SOG props: favor players whose team has high CF%/xGF% OR who face an opponent with low CF%/xGF%.
 
 PROP TYPES — only use props that exist on major sportsbooks:
-- SOG: individual player shots on goal (2+, 3+, 4+, 5+)
+- SOG: individual player shots on goal. Forwards: 2+, 3+, 4+, 5+. Defensemen (LD/RD): 1+, 2+, 3+.
 - POINTS: individual player points (1+, 2+)
 - GOALS: individual player to score a goal (anytime, 2+)
 Do NOT create team props, game totals, or combined multi-stat props.
+
+DEFENSEMEN NOTE: D-men (LD/RD) average 1.5–3.0 SOG/g vs forwards at 2.0–4.5+. Only target D-men with Edge >= 6 AND either PP1 time (pp_unit=1) or high season SOG (>2.5). Adjust SOG thresholds down: use 1+/2+/3+ rungs instead of 2+/3+/4+.
 
 RULES:
 - Generate 3-6 combos total. ALWAYS include at least one SOG combo — it is required. For the remaining slots, only include a type if the data shows genuine edge. Do NOT force GOALS or POINTS just for variety.
@@ -557,10 +559,11 @@ function NHLBetModel() {
               <div style={{ fontSize:10, color:C.muted, letterSpacing:1, fontFamily:"'Barlow Condensed',sans-serif", marginBottom:8 }}>TONIGHT'S GOALIES (LIVE)</div>
               <div style={{ display:"flex", flexWrap:"wrap", gap:10 }}>
                 {Object.entries(liveData.goalie_details).map(([team, g]) => (
-                  <div key={team} style={{ display:"flex", alignItems:"center", gap:8, padding:"5px 10px", background:C.card, borderRadius:5, border:`1px solid ${C.border}` }}>
+                  <div key={team} style={{ display:"flex", alignItems:"center", gap:8, padding:"5px 10px", background:C.card, borderRadius:5, border:`1px solid ${g.confirmed?C.green+"55":C.border}` }}>
                     <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontWeight:700, fontSize:13, color:C.accent }}>{team}</span>
                     <span style={{ fontSize:12, color:C.text }}>{g.name}</span>
                     <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:g.save_pct<=0.905?C.green:g.save_pct>=0.920?C.red:C.gold }}>{g.save_pct?.toFixed(3)}</span>
+                    {g.confirmed && <span style={{ fontSize:10, color:C.green, fontWeight:700 }}>✓</span>}
                   </div>
                 ))}
               </div>
