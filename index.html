@@ -82,14 +82,21 @@ function buildAnalysisPrompt(games) {
 
 You receive pre-scored player data. Edge (1-10) and Grade (A/B/C) are computed from: L10 trend (28%), goalie SV% (26%), shots-against (14%), PP TOI (15%), home/away split (12%), B2B penalty, TOI trend. COPY THESE EXACT VALUES — do not estimate or change them.
 
+PROP TYPES — only use props that exist on major sportsbooks:
+- SOG: individual player shots on goal (2+, 3+, 4+, 5+)
+- POINTS: individual player points (1+, 2+)
+- GOALS: individual player to score a goal (anytime, 2+)
+Do NOT create team props, game totals, or combined multi-stat props.
+
 RULES:
-- 4 combos required: one SOG, one POINTS, one GOALS, one COMBO
-- 2 OR 3 players per combo — pick the best count
+- Generate 3-6 combos total. ALWAYS include at least one SOG combo — it is required. For the remaining slots, only include a type if the data shows genuine edge. Do NOT force GOALS or POINTS just for variety.
+- COMBO type is allowed: a parlay mixing 2+ different prop types (e.g. one player SOG + another player to score). Must still be individual player props only.
+- 2 OR 3 players per combo — all must be individual player props from the list above
 - Cross-game combos encouraged — players need not be in the same game
 - List all games involved in the games field
 - No more than 2 combos sharing the same game
-- EXPOSURE LIMIT: no player in more than 2 of the 4 combos — count and enforce before output
-- Penalize B2B players unless Edge is still strong
+- HARD EXPOSURE LIMIT: no player may appear in more than 2 combos total. Before outputting, count every player's appearances across all combos. If any player appears 3+ times, remove them from their lowest-edge combo. Re-check until all players are at 2 or fewer.
+- Penalize B2B players unless Edge >= 7
 - Home players preferred over away at equal Edge
 - PP_TOI > 2.5min is a meaningful advantage
 
